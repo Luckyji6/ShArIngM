@@ -1,11 +1,13 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Modal, notification, Spin } from "antd";
 import {
   AlertTriangle,
   Cast,
   Check,
+  ClipboardCopy,
   CircleX,
   Download,
   FolderOpen,
@@ -72,6 +74,15 @@ type TransferRecord = {
   completed_at_ms: number;
 };
 
+type ClipboardTextRecord = {
+  id: string;
+  sender_device_id: string;
+  sender_device_name: string;
+  preview: string;
+  char_count: number;
+  received_at_ms: number;
+};
+
 type ScreenSession = {
   id: string;
   device_id: string;
@@ -84,6 +95,15 @@ type ScreenSession = {
   started_at_ms: number;
 };
 
+type ScreenFrame = {
+  session: ScreenSession;
+  width: number;
+  height: number;
+  mime_type: string;
+  data_url: string;
+  updated_at_ms: number;
+};
+
 type AppSnapshot = {
   identity: DeviceIdentity;
   mode: AppMode;
@@ -93,6 +113,7 @@ type AppSnapshot = {
   discovered_devices: LanDevice[];
   pending_pairing?: PendingPairing;
   transfers: TransferRecord[];
+  clipboard_texts: ClipboardTextRecord[];
   screen_session?: ScreenSession;
 };
 
@@ -133,7 +154,7 @@ const DEFAULT_DISPLAY = {
   display_name: "Primary Display",
   width: 1920,
   height: 1080,
-  fps: 30,
+  fps: 20,
   bitrate_kbps: 12000,
 };
 
@@ -142,12 +163,14 @@ function App() {
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
   const [pairingCode, setPairingCode] = useState("");
   const [filePath, setFilePath] = useState("");
+  const [clipboardText, setClipboardText] = useState("");
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [diagnosticOpen, setDiagnosticOpen] = useState(false);
   const [diagnostic, setDiagnostic] = useState<NetworkDiagnosticReport | null>(null);
   const [diagnosticRunning, setDiagnosticRunning] = useState(false);
+  const [latestScreenFrame, setLatestScreenFrame] = useState<ScreenFrame | null>(null);
 
   const selectedDevice = useMemo(() => {
     if (!snapshot) return undefined;
@@ -168,6 +191,22 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let cleanup: (() => void) | undefined;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "drop" && event.payload.paths[0]) {
+          setFilePath(event.payload.paths[0]);
+          notify("info", "已选择文件", event.payload.paths[0]);
+        }
+      })
+      .then((unlisten) => {
+        cleanup = unlisten;
+      })
+      .catch(() => undefined);
+    return () => cleanup?.();
+  }, []);
+
+  useEffect(() => {
     if (!snapshot || selectedDeviceId) return;
     const first = snapshot.discovered_devices[0];
     if (first) setSelectedDeviceId(first.device_id);
@@ -178,6 +217,9 @@ function App() {
     const timer = window.setInterval(() => {
       invoke<AppSnapshot>("get_snapshot")
         .then(setSnapshot)
+        .catch(() => undefined);
+      invoke<ScreenFrame | null>("get_latest_screen_frame")
+        .then(setLatestScreenFrame)
         .catch(() => undefined);
     }, 1200);
     return () => window.clearInterval(timer);
@@ -303,6 +345,24 @@ function App() {
     );
   }
 
+  async function sendClipboardText() {
+    if (!selectedDeviceId || !clipboardText.trim()) return;
+    await run(
+      () =>
+        invoke<ClipboardTextRecord>("send_clipboard_text_to_device", {
+          request: {
+            target_device_id: selectedDeviceId,
+            text: clipboardText,
+          },
+        }),
+      (record) => {
+        notify("success", "已写入被控端剪贴板", `${record.char_count} 个字符`);
+        setClipboardText("");
+        refresh();
+      },
+    );
+  }
+
   async function startScreen() {
     if (!selectedDeviceId) return;
     await run(
@@ -346,6 +406,27 @@ function App() {
         notify("success", "已移除可信设备");
       },
     );
+  }
+
+  function clearTrusted() {
+    Modal.confirm({
+      title: "清空可信设备？",
+      content: "清空后，所有设备再次连接都需要重新验证码验证。",
+      okText: "清空",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        await run(
+          () => invoke<AppSnapshot>("clear_trusted_devices"),
+          (next) => {
+            setSnapshot(next);
+            setSelectedDeviceId("");
+            setPairingCode("");
+            notify("success", "已清空可信设备");
+          },
+        );
+      },
+    });
   }
 
   async function openDiagnostic() {
@@ -428,6 +509,7 @@ function App() {
             onClose={() => setSettingsOpen(false)}
             onSetMode={setMode}
             onOpenDiagnostic={openDiagnostic}
+            onClearTrusted={clearTrusted}
           />
         ) : snapshot.mode === "receiver" ? (
           <ReceiverView
@@ -436,7 +518,9 @@ function App() {
             onStart={refreshReceiverService}
             onOpenDownloads={openDownloads}
             onRemoveTrusted={removeTrusted}
+            onClearTrusted={clearTrusted}
             onOpenDiagnostic={openDiagnostic}
+            latestScreenFrame={latestScreenFrame}
           />
         ) : (
           <SenderView
@@ -454,7 +538,10 @@ function App() {
             onVerify={verify}
             onCodeChange={setPairingCode}
             onFileChange={setFilePath}
+            clipboardText={clipboardText}
+            onClipboardTextChange={setClipboardText}
             onSendFile={sendFile}
+            onSendClipboardText={sendClipboardText}
             onStartScreen={startScreen}
             onStopScreen={stopScreen}
             onOpenDownloads={openDownloads}
@@ -480,6 +567,7 @@ function SettingsView(props: {
   onClose: () => void;
   onSetMode: (mode: AppMode) => Promise<boolean>;
   onOpenDiagnostic: () => void;
+  onClearTrusted: () => void;
 }) {
   const [pendingMode, setPendingMode] = useState<AppMode>(props.snapshot.mode);
   const changed = pendingMode !== props.snapshot.mode;
@@ -554,6 +642,22 @@ function SettingsView(props: {
             运行网络自查
           </button>
         </div>
+        <div className="settingBlock dangerBlock">
+          <div>
+            <strong>信任数据</strong>
+            <p>
+              清空本机记录的所有可信设备。用于重新测试验证码配对，或者撤销之前误保存的设备信任。
+            </p>
+          </div>
+          <button
+            className="dangerButton"
+            onClick={props.onClearTrusted}
+            disabled={props.busy || props.snapshot.trusted_devices.length === 0}
+          >
+            <Trash2 size={17} />
+            清空可信设备
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -568,13 +672,16 @@ function SenderView(props: {
   isTrusted: boolean;
   pairingCode: string;
   filePath: string;
+  clipboardText: string;
   onDiscover: () => void;
   onSelect: (id: string) => void;
   onPair: () => void;
   onVerify: () => void;
   onCodeChange: (code: string) => void;
   onFileChange: (path: string) => void;
+  onClipboardTextChange: (text: string) => void;
   onSendFile: () => void;
+  onSendClipboardText: () => void;
   onStartScreen: () => void;
   onStopScreen: () => void;
   onOpenDownloads: () => void;
@@ -723,6 +830,30 @@ function SenderView(props: {
             </button>
             <TransferList transfers={props.snapshot.transfers} />
           </section>
+
+          <section className="panel clipboardPanel">
+            <PanelTitle icon={<ClipboardCopy size={19} />} title="剪贴板文本" />
+            <textarea
+              value={props.clipboardText}
+              onChange={(event) => props.onClipboardTextChange(event.target.value)}
+              placeholder="输入要复制到被控端剪贴板的文本"
+              maxLength={64 * 1024}
+            />
+            <div className="rowActions">
+              <button
+                className="primary"
+                onClick={props.onSendClipboardText}
+                disabled={
+                  props.busy || !props.isTrusted || !props.clipboardText.trim()
+                }
+              >
+                <ClipboardCopy size={17} />
+                复制到被控端
+              </button>
+              <span className="muted">{props.clipboardText.length}/65536</span>
+            </div>
+            <ClipboardList records={props.snapshot.clipboard_texts} />
+          </section>
         </>
       ) : (
         <section className="panel placeholderPanel">
@@ -740,8 +871,15 @@ function ReceiverView(props: {
   onStart: () => void;
   onOpenDownloads: () => void;
   onRemoveTrusted: (id: string) => void;
+  onClearTrusted: () => void;
   onOpenDiagnostic: () => void;
+  latestScreenFrame: ScreenFrame | null;
 }) {
+  const screenAge = props.latestScreenFrame
+    ? Date.now() - props.latestScreenFrame.updated_at_ms
+    : Infinity;
+  const screenStale = screenAge > 3500;
+
   return (
     <div className="grid receiverGrid">
       <section className="panel receiverHero">
@@ -775,8 +913,42 @@ function ReceiverView(props: {
         </button>
       </section>
 
+      <section className="panel receiverScreen">
+        <PanelTitle icon={<ScreenShare size={19} />} title="接收画面" />
+        {props.latestScreenFrame ? (
+          <>
+            <div className="receiverScreenMeta">
+              <strong>{props.latestScreenFrame.session.display_name}</strong>
+              <span>
+                {props.latestScreenFrame.width}x{props.latestScreenFrame.height}
+                {screenStale ? " · 已暂停" : " · 实时接收"}
+              </span>
+            </div>
+            <img
+              src={props.latestScreenFrame.data_url}
+              alt="远端屏幕画面"
+              className={`receiverScreenImage ${screenStale ? "stale" : ""}`}
+            />
+          </>
+        ) : (
+          <div className="screenPreview">
+            <span>等待控制端开始屏幕共享</span>
+          </div>
+        )}
+      </section>
+
       <section className="panel trusted">
-        <PanelTitle icon={<ShieldCheck size={19} />} title="可信设备" />
+        <div className="trustedHeader">
+          <PanelTitle icon={<ShieldCheck size={19} />} title="可信设备" />
+          <button
+            className="dangerButton ghostDanger"
+            onClick={props.onClearTrusted}
+            disabled={props.busy || props.snapshot.trusted_devices.length === 0}
+          >
+            <Trash2 size={16} />
+            清空
+          </button>
+        </div>
         {props.snapshot.trusted_devices.length === 0 && (
           <Empty text="暂无可信设备。首次连接需要验证码。" />
         )}
@@ -796,6 +968,11 @@ function ReceiverView(props: {
       <section className="panel transfer history">
         <PanelTitle icon={<Send size={19} />} title="接收记录" />
         <TransferList transfers={props.snapshot.transfers} />
+      </section>
+
+      <section className="panel clipboardPanel">
+        <PanelTitle icon={<ClipboardCopy size={19} />} title="剪贴板记录" />
+        <ClipboardList records={props.snapshot.clipboard_texts} />
       </section>
     </div>
   );
@@ -932,6 +1109,21 @@ function TransferList({ transfers }: { transfers: TransferRecord[] }) {
           <span>
             {formatBytes(transfer.size_bytes)} · {compact(transfer.hash)}
           </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ClipboardList({ records }: { records: ClipboardTextRecord[] }) {
+  if (records.length === 0) return <Empty text="还没有剪贴板记录。" />;
+  return (
+    <div className="clipboardList">
+      {records.map((record) => (
+        <div key={record.id} className="clipboardRow">
+          <strong>{record.sender_device_name}</strong>
+          <p>{record.preview || "(空文本)"}</p>
+          <span>{record.char_count} 个字符</span>
         </div>
       ))}
     </div>

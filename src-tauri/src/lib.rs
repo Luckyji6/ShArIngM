@@ -1,3 +1,5 @@
+mod autostart;
+mod clipboard;
 mod discovery;
 mod display;
 mod identity;
@@ -10,14 +12,24 @@ use crate::{
     display::{CaptureSource, DisplaySource, VirtualDisplaySource},
     identity::Identity,
     models::{
-        AppMode, AppSnapshot, DisplaySourceKind, FileTransferRequest, LanDevice,
-        NetworkDiagnosticReport, PairingResult, PendingPairing, ScreenSession, StartScreenRequest,
-        TransferRecord,
+        AppMode, AppSnapshot, ClipboardTextRecord, ClipboardTextRequest, DisplaySourceKind,
+        FileTransferRequest, LanDevice, NetworkDiagnosticReport, PairingResult, PendingPairing,
+        ScreenFrame, ScreenSession, StartScreenRequest, TransferRecord,
     },
     storage::StoredConfig,
 };
 use anyhow::{bail, Context, Result};
-use std::{collections::HashMap, path::PathBuf, process::Command, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 use tauri::{AppHandle, Manager, State};
 
 struct SharedApp {
@@ -32,7 +44,10 @@ struct AppCore {
     discovered: HashMap<String, LanDevice>,
     pending_pairing: Option<PendingPairing>,
     transfers: Vec<TransferRecord>,
+    clipboard_texts: Vec<ClipboardTextRecord>,
     screen_session: Option<ScreenSession>,
+    screen_stream_shutdown: Option<Arc<AtomicBool>>,
+    screen_stream_thread: Option<JoinHandle<()>>,
     discovery_active: bool,
 }
 
@@ -48,7 +63,10 @@ impl AppCore {
             discovered: HashMap::new(),
             pending_pairing: None,
             transfers: Vec::new(),
+            clipboard_texts: Vec::new(),
             screen_session: None,
+            screen_stream_shutdown: None,
+            screen_stream_thread: None,
             discovery_active: false,
         })
     }
@@ -59,17 +77,28 @@ impl AppCore {
 
     fn sync_runtime_updates(&mut self) -> Result<()> {
         let updates = self.discovery.drain_trusted_updates();
-        if updates.is_empty() {
-            return Ok(());
-        }
+        let transfers = self.discovery.drain_transfer_updates();
+        let clipboard_texts = self.discovery.drain_clipboard_updates();
+        let mut changed = false;
 
         for trusted in updates {
             self.config
                 .trusted_devices
                 .retain(|device| device.device_id != trusted.device_id);
             self.config.trusted_devices.push(trusted);
+            changed = true;
         }
-        self.save()
+        for transfer in transfers {
+            self.transfers.insert(0, transfer);
+        }
+        for record in clipboard_texts {
+            self.clipboard_texts.insert(0, record);
+        }
+
+        if changed {
+            self.save()?;
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> AppSnapshot {
@@ -88,6 +117,7 @@ impl AppCore {
                 .pending_pairing()
                 .or_else(|| self.pending_pairing.clone()),
             transfers: self.transfers.clone(),
+            clipboard_texts: self.clipboard_texts.clone(),
             screen_session: self.screen_session.clone(),
         }
     }
@@ -97,11 +127,13 @@ impl AppCore {
         self.config.autostart_required = mode == AppMode::Receiver;
 
         if mode == AppMode::Receiver {
+            autostart::enable_receiver_autostart()?;
             let identity = self.identity.clone();
             let config_path = self.config_path.clone();
             self.discovery.start_receiver(&identity, config_path)?;
             self.discovery_active = true;
         } else {
+            autostart::disable_receiver_autostart()?;
             self.discovery.stop();
             self.discovery_active = false;
         }
@@ -180,6 +212,16 @@ impl AppCore {
 
         Ok(result)
     }
+
+    fn stop_screen_stream(&mut self) {
+        if let Some(shutdown) = self.screen_stream_shutdown.take() {
+            shutdown.store(true, Ordering::SeqCst);
+        }
+        if let Some(handle) = self.screen_stream_thread.take() {
+            let _ = handle.join();
+        }
+        self.screen_session = None;
+    }
 }
 
 #[tauri::command]
@@ -249,18 +291,83 @@ fn remove_trusted_device(
 }
 
 #[tauri::command]
+fn clear_trusted_devices(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
+    let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+    core.config.trusted_devices.clear();
+    core.pending_pairing = None;
+    core.save().map_err(to_command_error)?;
+    Ok(core.snapshot())
+}
+
+#[tauri::command]
 fn send_file_to_device(
     request: FileTransferRequest,
     state: State<'_, SharedApp>,
 ) -> Result<TransferRecord, String> {
-    {
+    let (device, requester) = {
         let core = state.inner.lock().map_err(|_| "state lock poisoned")?;
         ensure_trusted_or_local(&core, &request.target_device_id).map_err(to_command_error)?;
+        let device = core
+            .discovered
+            .get(&request.target_device_id)
+            .cloned()
+            .context("target device was not found")
+            .map_err(to_command_error)?;
+        (device, core.identity.public_identity())
+    };
+
+    let candidates = discovery::candidate_addresses_for(&device);
+    let (reachable, record) =
+        discovery::send_remote_file(&candidates, device.port, &requester, &request.source_path)
+            .map_err(to_command_error)?;
+    let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+    if let Some(stored) = core.discovered.get_mut(&device.device_id) {
+        stored.address = reachable.clone();
+        if !stored.extra_addresses.iter().any(|item| item == &reachable) {
+            stored.extra_addresses.insert(0, reachable);
+        }
+    }
+    core.transfers.insert(0, record.clone());
+    Ok(record)
+}
+
+#[tauri::command]
+fn send_clipboard_text_to_device(
+    request: ClipboardTextRequest,
+    state: State<'_, SharedApp>,
+) -> Result<ClipboardTextRecord, String> {
+    if request.text.trim().is_empty() {
+        return Err("剪贴板文本不能为空。".to_string());
+    }
+    if request.text.len() > 64 * 1024 {
+        return Err("剪贴板文本不能超过 64KB。".to_string());
     }
 
-    let record = transfer::copy_to_downloads(&request.source_path).map_err(to_command_error)?;
+    let (device, requester) = {
+        let core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+        ensure_trusted_or_local(&core, &request.target_device_id).map_err(to_command_error)?;
+        let device = core
+            .discovered
+            .get(&request.target_device_id)
+            .cloned()
+            .context("target device was not found")
+            .map_err(to_command_error)?;
+        (device, core.identity.public_identity())
+    };
+
+    let candidates = discovery::candidate_addresses_for(&device);
+    let (reachable, record) =
+        discovery::send_remote_clipboard_text(&candidates, device.port, &requester, &request.text)
+            .map_err(to_command_error)?;
+
     let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
-    core.transfers.insert(0, record.clone());
+    if let Some(stored) = core.discovered.get_mut(&device.device_id) {
+        stored.address = reachable.clone();
+        if !stored.extra_addresses.iter().any(|item| item == &reachable) {
+            stored.extra_addresses.insert(0, reachable);
+        }
+    }
+    core.clipboard_texts.insert(0, record.clone());
     Ok(record)
 }
 
@@ -269,19 +376,77 @@ fn start_screen_share(
     request: StartScreenRequest,
     state: State<'_, SharedApp>,
 ) -> Result<ScreenSession, String> {
+    let (device, sender, session, shutdown) = {
+        let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+        ensure_trusted_or_local(&core, &request.target_device_id).map_err(to_command_error)?;
+        let device = core
+            .discovered
+            .get(&request.target_device_id)
+            .cloned()
+            .context("target device was not found")
+            .map_err(to_command_error)?;
+        core.stop_screen_stream();
+        let source = CaptureSource;
+        let session = source.start(request);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        core.screen_session = Some(session.clone());
+        (device, core.identity.public_identity(), session, shutdown)
+    };
+
+    let thread_shutdown = shutdown.clone();
+    let session_for_thread = session.clone();
+    let handle = thread::spawn(move || {
+        let fps = session_for_thread.fps.clamp(1, 20);
+        let delay = Duration::from_millis((1000 / fps as u64).max(80));
+        let mut reachable = discovery::candidate_addresses_for(&device);
+        while !thread_shutdown.load(Ordering::SeqCst) {
+            match display::capture_primary_frame(
+                session_for_thread.width,
+                session_for_thread.height,
+            ) {
+                Ok(frame) => {
+                    match discovery::send_screen_frame(
+                        &reachable,
+                        device.port,
+                        &sender,
+                        &session_for_thread,
+                        frame.width,
+                        frame.height,
+                        frame.mime_type,
+                        frame.bytes,
+                    ) {
+                        Ok(address) => {
+                            if reachable.first() != Some(&address) {
+                                reachable.retain(|item| item != &address);
+                                reachable.insert(0, address);
+                            }
+                        }
+                        Err(error) => eprintln!("screen frame send failed: {error:#}"),
+                    }
+                }
+                Err(error) => eprintln!("screen capture failed: {error:#}"),
+            }
+            thread::sleep(delay);
+        }
+    });
+
     let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
-    ensure_trusted_or_local(&core, &request.target_device_id).map_err(to_command_error)?;
-    let source = CaptureSource;
-    let session = source.start(request);
-    core.screen_session = Some(session.clone());
+    core.screen_stream_shutdown = Some(shutdown);
+    core.screen_stream_thread = Some(handle);
     Ok(session)
 }
 
 #[tauri::command]
 fn stop_screen_share(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
     let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
-    core.screen_session = None;
+    core.stop_screen_stream();
     Ok(core.snapshot())
+}
+
+#[tauri::command]
+fn get_latest_screen_frame(state: State<'_, SharedApp>) -> Result<Option<ScreenFrame>, String> {
+    let core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+    Ok(core.discovery.latest_screen_frame())
 }
 
 #[tauri::command]
@@ -319,6 +484,7 @@ pub fn run() {
             let state = app.state::<SharedApp>();
             let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
             if core.config.mode == AppMode::Receiver {
+                autostart::enable_receiver_autostart()?;
                 let identity = core.identity.clone();
                 let config_path = core.config_path.clone();
                 core.discovery.start_receiver(&identity, config_path)?;
@@ -328,6 +494,11 @@ pub fn run() {
 
             #[cfg(desktop)]
             create_tray(app)?;
+            if autostart::is_background_launch() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -353,9 +524,12 @@ pub fn run() {
             request_pairing,
             verify_pairing,
             remove_trusted_device,
+            clear_trusted_devices,
             send_file_to_device,
+            send_clipboard_text_to_device,
             start_screen_share,
             stop_screen_share,
+            get_latest_screen_frame,
             open_downloads_folder,
             available_display_sources,
             run_network_diagnostic

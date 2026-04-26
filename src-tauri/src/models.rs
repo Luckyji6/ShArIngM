@@ -68,6 +68,16 @@ pub struct TransferRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardTextRecord {
+    pub id: String,
+    pub sender_device_id: String,
+    pub sender_device_name: String,
+    pub preview: String,
+    pub char_count: usize,
+    pub received_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenSession {
     pub id: String,
     pub device_id: String,
@@ -78,6 +88,16 @@ pub struct ScreenSession {
     pub bitrate_kbps: u32,
     pub source_kind: DisplaySourceKind,
     pub started_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenFrame {
+    pub session: ScreenSession,
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: String,
+    pub data_url: String,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +117,7 @@ pub struct AppSnapshot {
     pub discovered_devices: Vec<LanDevice>,
     pub pending_pairing: Option<PendingPairing>,
     pub transfers: Vec<TransferRecord>,
+    pub clipboard_texts: Vec<ClipboardTextRecord>,
     pub screen_session: Option<ScreenSession>,
 }
 
@@ -112,6 +133,12 @@ pub struct PairingResult {
 pub struct FileTransferRequest {
     pub source_path: String,
     pub target_device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardTextRequest {
+    pub target_device_id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

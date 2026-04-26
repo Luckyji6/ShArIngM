@@ -1,13 +1,15 @@
 use crate::{
+    clipboard,
     identity::Identity,
     models::{
-        AppMode, DeviceIdentity, DiagnosticInterface, DiagnosticItem, DiagnosticStatus, LanDevice,
-        NetworkDiagnosticReport, PairingResult, PendingPairing, TrustedDevice, PROTOCOL_VERSION,
-        SERVICE_TYPE,
+        AppMode, ClipboardTextRecord, DeviceIdentity, DiagnosticInterface, DiagnosticItem,
+        DiagnosticStatus, LanDevice, NetworkDiagnosticReport, PairingResult, PendingPairing,
+        ScreenFrame, ScreenSession, TransferRecord, TrustedDevice, PROTOCOL_VERSION, SERVICE_TYPE,
     },
-    storage,
+    storage, transfer,
 };
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::Rng;
@@ -24,6 +26,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 const SERVICE_PORT: u16 = 41874;
 const UDP_DISCOVERY_PORT: u16 = 41875;
@@ -60,6 +63,24 @@ enum ControlRequest {
         requester: DeviceIdentity,
         code: String,
     },
+    FilePush {
+        sender: DeviceIdentity,
+        file_name: String,
+        size_bytes: u64,
+        hash: String,
+    },
+    ScreenFrame {
+        sender: DeviceIdentity,
+        session: ScreenSession,
+        width: u32,
+        height: u32,
+        mime_type: String,
+        frame_size: u64,
+    },
+    ClipboardText {
+        sender: DeviceIdentity,
+        text: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,6 +93,15 @@ enum ControlResponse {
     },
     PairAccepted {
         trusted_device: TrustedDevice,
+        message: String,
+    },
+    FileAccepted {
+        record: TransferRecord,
+        message: String,
+    },
+    ScreenFrameAccepted,
+    ClipboardTextAccepted {
+        record: ClipboardTextRecord,
         message: String,
     },
     Error {
@@ -89,6 +119,9 @@ pub struct DiscoveryRuntime {
     tcp_thread: Option<JoinHandle<()>>,
     pending_pairing: Arc<Mutex<Option<IncomingPairing>>>,
     trusted_updates: Arc<Mutex<Vec<TrustedDevice>>>,
+    transfer_updates: Arc<Mutex<Vec<TransferRecord>>>,
+    clipboard_updates: Arc<Mutex<Vec<ClipboardTextRecord>>>,
+    latest_screen_frame: Arc<Mutex<Option<ScreenFrame>>>,
 }
 
 impl DiscoveryRuntime {
@@ -138,6 +171,27 @@ impl DiscoveryRuntime {
             .unwrap_or_default()
     }
 
+    pub fn drain_transfer_updates(&self) -> Vec<TransferRecord> {
+        self.transfer_updates
+            .lock()
+            .map(|mut updates| updates.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn drain_clipboard_updates(&self) -> Vec<ClipboardTextRecord> {
+        self.clipboard_updates
+            .lock()
+            .map(|mut updates| updates.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn latest_screen_frame(&self) -> Option<ScreenFrame> {
+        self.latest_screen_frame
+            .lock()
+            .ok()
+            .and_then(|frame| frame.clone())
+    }
+
     fn start_mdns_advertiser(&mut self, identity: &Identity) -> Result<()> {
         let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
         let public = identity.public_identity();
@@ -149,10 +203,7 @@ impl DiscoveryRuntime {
             ("public_key", public.public_key.as_str()),
             ("fingerprint", public.fingerprint.as_str()),
             ("protocol_version", PROTOCOL_VERSION),
-            (
-                "capabilities",
-                "screen_stream,file_push,clipboard_text_reserved",
-            ),
+            ("capabilities", "screen_stream,file_push,clipboard_text"),
         ];
         let info = ServiceInfo::new(
             SERVICE_TYPE,
@@ -251,6 +302,9 @@ impl DiscoveryRuntime {
         let receiver = identity.public_identity();
         let pending_pairing = self.pending_pairing.clone();
         let trusted_updates = self.trusted_updates.clone();
+        let transfer_updates = self.transfer_updates.clone();
+        let clipboard_updates = self.clipboard_updates.clone();
+        let latest_screen_frame = self.latest_screen_frame.clone();
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -263,6 +317,9 @@ impl DiscoveryRuntime {
                             &config_path,
                             &pending_pairing,
                             &trusted_updates,
+                            &transfer_updates,
+                            &clipboard_updates,
+                            &latest_screen_frame,
                         );
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -277,6 +334,106 @@ impl DiscoveryRuntime {
         self.tcp_thread = Some(handle);
         Ok(())
     }
+}
+
+pub fn send_remote_file(
+    addresses: &[String],
+    port: u16,
+    sender: &DeviceIdentity,
+    source_path: &str,
+) -> Result<(String, TransferRecord)> {
+    let source = transfer::inspect_source(source_path)?;
+    let mut errors = Vec::new();
+    for address in addresses {
+        if address.is_empty() {
+            continue;
+        }
+        match send_file_to_address(address, port, sender, &source) {
+            Ok(record) => return Ok((address.clone(), record)),
+            Err(error) => errors.push(format!("{address}: {error:#}")),
+        }
+    }
+
+    Err(anyhow!(
+        "all candidate addresses failed file transfer: {}",
+        errors.join("; ")
+    ))
+}
+
+pub fn send_screen_frame(
+    addresses: &[String],
+    port: u16,
+    sender: &DeviceIdentity,
+    session: &ScreenSession,
+    width: u32,
+    height: u32,
+    mime_type: String,
+    bytes: Vec<u8>,
+) -> Result<String> {
+    let mut errors = Vec::new();
+    let frame_size = bytes.len() as u64;
+    for address in addresses {
+        if address.is_empty() {
+            continue;
+        }
+        match send_control_request_with_body(
+            address,
+            port,
+            &ControlRequest::ScreenFrame {
+                sender: sender.clone(),
+                session: session.clone(),
+                width,
+                height,
+                mime_type: mime_type.clone(),
+                frame_size,
+            },
+            std::io::Cursor::new(bytes.clone()),
+        ) {
+            Ok(ControlResponse::ScreenFrameAccepted) => return Ok(address.clone()),
+            Ok(ControlResponse::Error { message }) => errors.push(format!("{address}: {message}")),
+            Ok(_) => errors.push(format!("{address}: unexpected screen frame response")),
+            Err(error) => errors.push(format!("{address}: {error:#}")),
+        }
+    }
+
+    Err(anyhow!(
+        "all candidate addresses failed screen frame transfer: {}",
+        errors.join("; ")
+    ))
+}
+
+pub fn send_remote_clipboard_text(
+    addresses: &[String],
+    port: u16,
+    sender: &DeviceIdentity,
+    text: &str,
+) -> Result<(String, ClipboardTextRecord)> {
+    let mut errors = Vec::new();
+    for address in addresses {
+        if address.is_empty() {
+            continue;
+        }
+        match send_control_request(
+            address,
+            port,
+            &ControlRequest::ClipboardText {
+                sender: sender.clone(),
+                text: text.to_string(),
+            },
+        ) {
+            Ok(ControlResponse::ClipboardTextAccepted { record, .. }) => {
+                return Ok((address.clone(), record));
+            }
+            Ok(ControlResponse::Error { message }) => errors.push(format!("{address}: {message}")),
+            Ok(_) => errors.push(format!("{address}: unexpected clipboard response")),
+            Err(error) => errors.push(format!("{address}: {error:#}")),
+        }
+    }
+
+    Err(anyhow!(
+        "all candidate addresses failed clipboard transfer: {}",
+        errors.join("; ")
+    ))
 }
 
 pub fn request_remote_pairing(
@@ -387,10 +544,7 @@ fn send_control_request(
     stream
         .set_write_timeout(Some(CONTROL_PROBE_TIMEOUT))
         .context("failed to configure control write timeout")?;
-    let payload = serde_json::to_vec(request).context("failed to encode control request")?;
-    stream
-        .write_all(&payload)
-        .context("failed to send control request")?;
+    write_control_header(&mut stream, request).context("failed to send control request")?;
     let _ = stream.shutdown(Shutdown::Write);
 
     let mut response = Vec::new();
@@ -400,12 +554,77 @@ fn send_control_request(
     serde_json::from_slice(&response).context("failed to decode control response")
 }
 
+fn send_file_to_address(
+    address: &str,
+    port: u16,
+    sender: &DeviceIdentity,
+    source: &transfer::SourceFile,
+) -> Result<TransferRecord> {
+    let response = send_control_request_with_body(
+        address,
+        port,
+        &ControlRequest::FilePush {
+            sender: sender.clone(),
+            file_name: source.file_name.clone(),
+            size_bytes: source.size_bytes,
+            hash: source.hash.clone(),
+        },
+        std::fs::File::open(&source.path)?,
+    )?;
+
+    match response {
+        ControlResponse::FileAccepted { record, .. } => Ok(record),
+        ControlResponse::Error { message } => Err(anyhow!(message)),
+        _ => Err(anyhow!("unexpected file transfer response from receiver")),
+    }
+}
+
+fn send_control_request_with_body<R: Read>(
+    address: &str,
+    port: u16,
+    request: &ControlRequest,
+    mut body: R,
+) -> Result<ControlResponse> {
+    let ip = address
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid device address {address}"))?;
+    let socket_addr = SocketAddr::new(ip, port);
+    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_millis(5000))
+        .with_context(|| format!("failed to connect to {socket_addr}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .context("failed to configure control read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .context("failed to configure control write timeout")?;
+    write_control_header(&mut stream, request)?;
+    std::io::copy(&mut body, &mut stream).context("failed to send file body")?;
+    let _ = stream.shutdown(Shutdown::Write);
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .context("failed to read control response")?;
+    serde_json::from_slice(&response).context("failed to decode control response")
+}
+
+fn write_control_header(stream: &mut TcpStream, request: &ControlRequest) -> Result<()> {
+    let payload = serde_json::to_vec(request).context("failed to encode control request")?;
+    let len = u32::try_from(payload.len()).context("control request is too large")?;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(&payload)?;
+    Ok(())
+}
+
 fn handle_control_stream(
     stream: &mut TcpStream,
     receiver: &DeviceIdentity,
     config_path: &Path,
     pending_pairing: &Arc<Mutex<Option<IncomingPairing>>>,
     trusted_updates: &Arc<Mutex<Vec<TrustedDevice>>>,
+    transfer_updates: &Arc<Mutex<Vec<TransferRecord>>>,
+    clipboard_updates: &Arc<Mutex<Vec<ClipboardTextRecord>>>,
+    latest_screen_frame: &Arc<Mutex<Option<ScreenFrame>>>,
 ) {
     let response = match read_control_request(stream) {
         Ok(ControlRequest::Ping) => ControlResponse::Pong,
@@ -420,6 +639,41 @@ fn handle_control_stream(
             pending_pairing,
             trusted_updates,
         ),
+        Ok(ControlRequest::FilePush {
+            sender,
+            file_name,
+            size_bytes,
+            hash,
+        }) => handle_file_push(
+            sender,
+            file_name,
+            size_bytes,
+            hash,
+            stream,
+            config_path,
+            transfer_updates,
+        ),
+        Ok(ControlRequest::ScreenFrame {
+            sender,
+            session,
+            width,
+            height,
+            mime_type,
+            frame_size,
+        }) => handle_screen_frame(
+            sender,
+            session,
+            width,
+            height,
+            mime_type,
+            frame_size,
+            stream,
+            config_path,
+            latest_screen_frame,
+        ),
+        Ok(ControlRequest::ClipboardText { sender, text }) => {
+            handle_clipboard_text(sender, text, config_path, clipboard_updates)
+        }
         Err(error) => ControlResponse::Error {
             message: error.to_string(),
         },
@@ -431,9 +685,17 @@ fn handle_control_stream(
 }
 
 fn read_control_request(stream: &mut TcpStream) -> Result<ControlRequest> {
-    let mut payload = Vec::new();
+    let mut len_bytes = [0_u8; 4];
     stream
-        .read_to_end(&mut payload)
+        .read_exact(&mut len_bytes)
+        .context("failed to read control request length")?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > 1024 * 1024 {
+        return Err(anyhow!("control request is too large"));
+    }
+    let mut payload = vec![0_u8; len];
+    stream
+        .read_exact(&mut payload)
         .context("failed to read control request")?;
     serde_json::from_slice(&payload).context("failed to decode control request")
 }
@@ -542,6 +804,150 @@ fn trusted_from_identity(identity: &DeviceIdentity, now: i64) -> TrustedDevice {
         trusted_at_ms: now,
         last_connected_ms: Some(now),
     }
+}
+
+fn handle_file_push(
+    sender: DeviceIdentity,
+    file_name: String,
+    size_bytes: u64,
+    hash: String,
+    stream: &mut TcpStream,
+    config_path: &Path,
+    transfer_updates: &Arc<Mutex<Vec<TransferRecord>>>,
+) -> ControlResponse {
+    if !is_trusted_sender(config_path, &sender) {
+        return ControlResponse::Error {
+            message: "发送端未受信任，请先完成验证码配对。".to_string(),
+        };
+    }
+
+    match transfer::write_incoming_file(&file_name, stream, size_bytes, &hash) {
+        Ok(record) => {
+            if let Ok(mut updates) = transfer_updates.lock() {
+                updates.push(record.clone());
+            }
+            ControlResponse::FileAccepted {
+                record,
+                message: "文件已保存到被控端下载目录。".to_string(),
+            }
+        }
+        Err(error) => ControlResponse::Error {
+            message: format!("文件接收失败：{error:#}"),
+        },
+    }
+}
+
+fn handle_screen_frame(
+    sender: DeviceIdentity,
+    session: ScreenSession,
+    width: u32,
+    height: u32,
+    mime_type: String,
+    frame_size: u64,
+    stream: &mut TcpStream,
+    config_path: &Path,
+    latest_screen_frame: &Arc<Mutex<Option<ScreenFrame>>>,
+) -> ControlResponse {
+    if !is_trusted_sender(config_path, &sender) {
+        return ControlResponse::Error {
+            message: "发送端未受信任，请先完成验证码配对。".to_string(),
+        };
+    }
+    if mime_type != "image/jpeg" && mime_type != "image/png" {
+        return ControlResponse::Error {
+            message: "屏幕帧格式不支持。".to_string(),
+        };
+    }
+    if frame_size == 0 || frame_size > 16 * 1024 * 1024 {
+        return ControlResponse::Error {
+            message: "屏幕帧大小无效。".to_string(),
+        };
+    }
+
+    let mut frame_bytes = vec![0_u8; frame_size as usize];
+    if let Err(error) = stream.read_exact(&mut frame_bytes) {
+        return ControlResponse::Error {
+            message: format!("屏幕帧读取失败：{error}"),
+        };
+    }
+
+    let data_url = format!(
+        "data:{mime_type};base64,{}",
+        general_purpose::STANDARD.encode(&frame_bytes)
+    );
+    let frame = ScreenFrame {
+        session,
+        width,
+        height,
+        mime_type,
+        data_url,
+        updated_at_ms: Utc::now().timestamp_millis(),
+    };
+
+    if let Ok(mut latest) = latest_screen_frame.lock() {
+        *latest = Some(frame);
+    }
+
+    ControlResponse::ScreenFrameAccepted
+}
+
+fn handle_clipboard_text(
+    sender: DeviceIdentity,
+    text: String,
+    config_path: &Path,
+    clipboard_updates: &Arc<Mutex<Vec<ClipboardTextRecord>>>,
+) -> ControlResponse {
+    if !is_trusted_sender(config_path, &sender) {
+        return ControlResponse::Error {
+            message: "发送端未受信任，请先完成验证码配对。".to_string(),
+        };
+    }
+    if text.is_empty() || text.len() > 64 * 1024 {
+        return ControlResponse::Error {
+            message: "剪贴板文本为空或超过 64KB。".to_string(),
+        };
+    }
+
+    if let Err(error) = clipboard::write_text(&text) {
+        return ControlResponse::Error {
+            message: format!("写入被控端剪贴板失败：{error:#}"),
+        };
+    }
+
+    let preview = text.chars().take(80).collect::<String>();
+    let record = ClipboardTextRecord {
+        id: Uuid::new_v4().to_string(),
+        sender_device_id: sender.device_id,
+        sender_device_name: sender.device_name,
+        preview,
+        char_count: text.chars().count(),
+        received_at_ms: Utc::now().timestamp_millis(),
+    };
+    if let Ok(mut updates) = clipboard_updates.lock() {
+        updates.push(record.clone());
+    }
+
+    ControlResponse::ClipboardTextAccepted {
+        record,
+        message: "文本已复制到被控端剪贴板。".to_string(),
+    }
+}
+
+fn is_trusted_sender(config_path: &Path, sender: &DeviceIdentity) -> bool {
+    if sender.device_id.trim().is_empty() || sender.public_key.trim().is_empty() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_str::<storage::StoredConfig>(&raw) else {
+        return false;
+    };
+    config.trusted_devices.iter().any(|trusted| {
+        trusted.device_id == sender.device_id
+            && trusted.public_key == sender.public_key
+            && trusted.fingerprint == sender.fingerprint
+    })
 }
 
 pub fn browse_once() -> Result<Vec<LanDevice>> {
@@ -809,7 +1215,7 @@ fn lan_device_from_identity(
         capabilities: vec![
             "screen_stream".to_string(),
             "file_push".to_string(),
-            "clipboard_text_reserved".to_string(),
+            "clipboard_text".to_string(),
         ],
         last_seen_ms: Utc::now().timestamp_millis(),
         extra_addresses,
