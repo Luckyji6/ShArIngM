@@ -185,6 +185,7 @@ impl DiscoveryRuntime {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub fn latest_screen_frame(&self) -> Option<ScreenFrame> {
         self.latest_screen_frame
             .lock()
@@ -360,6 +361,7 @@ pub fn send_remote_file(
     ))
 }
 
+#[allow(dead_code)]
 pub fn send_screen_frame(
     addresses: &[String],
     port: u16,

@@ -2,6 +2,21 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const SERVICE_TYPE: &str = "_sharingm._tcp.local.";
+pub const SCREEN_STREAM_PORT: u16 = 41876;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionStatus {
+    Granted,
+    Denied,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionState {
+    pub screen_capture: PermissionStatus,
+    pub hint: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

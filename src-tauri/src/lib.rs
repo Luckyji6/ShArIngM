@@ -4,6 +4,7 @@ mod discovery;
 mod display;
 mod identity;
 mod models;
+mod screen;
 mod storage;
 mod transfer;
 
@@ -14,25 +15,15 @@ use crate::{
     models::{
         AppMode, AppSnapshot, ClipboardTextRecord, ClipboardTextRequest, DisplaySourceKind,
         FileTransferRequest, LanDevice, NetworkDiagnosticReport, PairingResult, PendingPairing,
-        ScreenFrame, ScreenSession, StartScreenRequest, TransferRecord,
+        PermissionState, PermissionStatus, ScreenSession, StartScreenRequest, TransferRecord,
     },
     storage::StoredConfig,
 };
 use anyhow::{bail, Context, Result};
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    process::Command,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    thread::{self, JoinHandle},
-    time::Duration,
-};
+use chrono::Utc;
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::Mutex};
 use tauri::{AppHandle, Manager, State};
-
-struct SharedApp {
+use uuid::Uuid;struct SharedApp {
     inner: Mutex<AppCore>,
 }
 
@@ -46,8 +37,9 @@ struct AppCore {
     transfers: Vec<TransferRecord>,
     clipboard_texts: Vec<ClipboardTextRecord>,
     screen_session: Option<ScreenSession>,
-    screen_stream_shutdown: Option<Arc<AtomicBool>>,
-    screen_stream_thread: Option<JoinHandle<()>>,
+    capture_session: Option<screen::CaptureSession>,
+    frame_server: Option<screen::FrameServer>,
+    app_handle: Option<AppHandle>,
     discovery_active: bool,
 }
 
@@ -65,8 +57,9 @@ impl AppCore {
             transfers: Vec::new(),
             clipboard_texts: Vec::new(),
             screen_session: None,
-            screen_stream_shutdown: None,
-            screen_stream_thread: None,
+            capture_session: None,
+            frame_server: None,
+            app_handle: None,
             discovery_active: false,
         })
     }
@@ -132,14 +125,26 @@ impl AppCore {
             let config_path = self.config_path.clone();
             self.discovery.start_receiver(&identity, config_path)?;
             self.discovery_active = true;
+            self.ensure_frame_server_started();
         } else {
             autostart::disable_receiver_autostart()?;
             self.discovery.stop();
             self.discovery_active = false;
+            self.frame_server = None;
+            self.capture_session = None;
+            self.screen_session = None;
         }
 
         self.save()?;
         Ok(self.snapshot())
+    }
+
+    fn ensure_frame_server_started(&mut self) {
+        if self.frame_server.is_none() {
+            if let Some(handle) = &self.app_handle {
+                self.frame_server = screen::FrameServer::start(handle.clone()).ok();
+            }
+        }
     }
 
     fn merge_discovered(&mut self, devices: Vec<LanDevice>) {
@@ -214,12 +219,7 @@ impl AppCore {
     }
 
     fn stop_screen_stream(&mut self) {
-        if let Some(shutdown) = self.screen_stream_shutdown.take() {
-            shutdown.store(true, Ordering::SeqCst);
-        }
-        if let Some(handle) = self.screen_stream_thread.take() {
-            let _ = handle.join();
-        }
+        self.capture_session = None;
         self.screen_session = None;
     }
 }
@@ -246,6 +246,7 @@ fn start_receiver_services(state: State<'_, SharedApp>) -> Result<AppSnapshot, S
         .start_receiver(&identity, config_path)
         .map_err(to_command_error)?;
     core.discovery_active = true;
+    core.ensure_frame_server_started();
     Ok(core.snapshot())
 }
 
@@ -376,64 +377,79 @@ fn start_screen_share(
     request: StartScreenRequest,
     state: State<'_, SharedApp>,
 ) -> Result<ScreenSession, String> {
-    let (device, sender, session, shutdown) = {
+    // Permission gate (macOS only; other platforms always pass)
+    if screen::preflight_screen_capture() != PermissionStatus::Granted {
+        return Err(
+            "屏幕录制权限未授权。请在系统设置 > 隐私与安全 > 屏幕录制中授权 ShArIngM，然后重启应用。"
+                .to_string(),
+        );
+    }
+
+    let (device, session) = {
         let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
         ensure_trusted_or_local(&core, &request.target_device_id).map_err(to_command_error)?;
+
         let device = core
             .discovered
             .get(&request.target_device_id)
             .cloned()
-            .context("target device was not found")
+            .context("目标设备未在已发现列表中，请先扫描设备")
             .map_err(to_command_error)?;
-        core.stop_screen_stream();
-        let source = CaptureSource;
-        let session = source.start(request);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        core.screen_session = Some(session.clone());
-        (device, core.identity.public_identity(), session, shutdown)
+
+        // Stop previous capture if any
+        core.capture_session = None;
+        core.screen_session = None;
+
+        let session = ScreenSession {
+            id: Uuid::new_v4().to_string(),
+            device_id: request.target_device_id.clone(),
+            display_name: request.display_name.clone(),
+            width: request.width.clamp(640, 3840),
+            height: request.height.clamp(360, 2160),
+            fps: request.fps.clamp(5, 30),
+            bitrate_kbps: request.bitrate_kbps.clamp(1_000, 40_000),
+            source_kind: DisplaySourceKind::CaptureSource,
+            started_at_ms: Utc::now().timestamp_millis(),
+        };
+        (device, session)
     };
 
-    let thread_shutdown = shutdown.clone();
-    let session_for_thread = session.clone();
-    let handle = thread::spawn(move || {
-        let fps = session_for_thread.fps.clamp(1, 20);
-        let delay = Duration::from_millis((1000 / fps as u64).max(80));
-        let mut reachable = discovery::candidate_addresses_for(&device);
-        while !thread_shutdown.load(Ordering::SeqCst) {
-            match display::capture_primary_frame(
-                session_for_thread.width,
-                session_for_thread.height,
-            ) {
-                Ok(frame) => {
-                    match discovery::send_screen_frame(
-                        &reachable,
-                        device.port,
-                        &sender,
-                        &session_for_thread,
-                        frame.width,
-                        frame.height,
-                        frame.mime_type,
-                        frame.bytes,
-                    ) {
-                        Ok(address) => {
-                            if reachable.first() != Some(&address) {
-                                reachable.retain(|item| item != &address);
-                                reachable.insert(0, address);
-                            }
-                        }
-                        Err(error) => eprintln!("screen frame send failed: {error:#}"),
-                    }
-                }
-                Err(error) => eprintln!("screen capture failed: {error:#}"),
+    let fps = session.fps;
+    let quality = quality_from_bitrate(session.bitrate_kbps);
+    let candidates = discovery::candidate_addresses_for(&device);
+
+    // Try each candidate address until one connects
+    let mut capture_result: Result<screen::CaptureSession> =
+        Err(anyhow::anyhow!("候选地址列表为空"));
+    for addr in &candidates {
+        match screen::CaptureSession::start(addr.clone(), fps, quality) {
+            Ok(c) => {
+                capture_result = Ok(c);
+                break;
             }
-            thread::sleep(delay);
+            Err(e) => {
+                capture_result = Err(e);
+            }
         }
-    });
+    }
+
+    let capture = capture_result
+        .context("无法连接被控端屏幕流端口，请确认被控端已启动并允许防火墙访问 41876")
+        .map_err(to_command_error)?;
 
     let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
-    core.screen_stream_shutdown = Some(shutdown);
-    core.screen_stream_thread = Some(handle);
+    core.capture_session = Some(capture);
+    core.screen_session = Some(session.clone());
     Ok(session)
+}
+
+fn quality_from_bitrate(bitrate_kbps: u32) -> u8 {
+    match bitrate_kbps {
+        0..=2000 => 55,
+        2001..=6000 => 68,
+        6001..=14000 => 78,
+        _ => 88,
+    }
 }
 
 #[tauri::command]
@@ -444,9 +460,14 @@ fn stop_screen_share(state: State<'_, SharedApp>) -> Result<AppSnapshot, String>
 }
 
 #[tauri::command]
-fn get_latest_screen_frame(state: State<'_, SharedApp>) -> Result<Option<ScreenFrame>, String> {
-    let core = state.inner.lock().map_err(|_| "state lock poisoned")?;
-    Ok(core.discovery.latest_screen_frame())
+fn check_screen_permission() -> Result<PermissionState, String> {
+    Ok(screen::check_permission_state())
+}
+
+#[tauri::command]
+fn request_screen_permission() -> Result<PermissionState, String> {
+    screen::request_screen_capture_permission();
+    Ok(screen::check_permission_state())
 }
 
 #[tauri::command]
@@ -483,12 +504,14 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<SharedApp>();
             let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+            core.app_handle = Some(app.app_handle().clone());
             if core.config.mode == AppMode::Receiver {
                 autostart::enable_receiver_autostart()?;
                 let identity = core.identity.clone();
                 let config_path = core.config_path.clone();
                 core.discovery.start_receiver(&identity, config_path)?;
                 core.discovery_active = true;
+                core.ensure_frame_server_started();
             }
             drop(core);
 
@@ -527,9 +550,10 @@ pub fn run() {
             clear_trusted_devices,
             send_file_to_device,
             send_clipboard_text_to_device,
+            check_screen_permission,
+            request_screen_permission,
             start_screen_share,
             stop_screen_share,
-            get_latest_screen_frame,
             open_downloads_folder,
             available_display_sources,
             run_network_diagnostic

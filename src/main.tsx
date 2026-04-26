@@ -1,14 +1,15 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Modal, notification, Spin } from "antd";
 import {
   AlertTriangle,
   Cast,
   Check,
-  ClipboardCopy,
   CircleX,
+  ClipboardCopy,
   Download,
   FolderOpen,
   Info,
@@ -20,6 +21,7 @@ import {
   ScreenShare,
   Send,
   ShieldCheck,
+  ShieldX,
   Stethoscope,
   Trash2,
   Wifi,
@@ -95,13 +97,17 @@ type ScreenSession = {
   started_at_ms: number;
 };
 
-type ScreenFrame = {
-  session: ScreenSession;
-  width: number;
-  height: number;
-  mime_type: string;
-  data_url: string;
-  updated_at_ms: number;
+// Live frame pushed via Tauri event "screen_frame"
+type ScreenFrameEvent = {
+  index: number;
+  jpeg_b64: string;
+};
+
+type PermissionStatus = "granted" | "denied" | "unknown";
+
+type PermissionState = {
+  screen_capture: PermissionStatus;
+  hint: string;
 };
 
 type AppSnapshot = {
@@ -170,7 +176,11 @@ function App() {
   const [diagnosticOpen, setDiagnosticOpen] = useState(false);
   const [diagnostic, setDiagnostic] = useState<NetworkDiagnosticReport | null>(null);
   const [diagnosticRunning, setDiagnosticRunning] = useState(false);
-  const [latestScreenFrame, setLatestScreenFrame] = useState<ScreenFrame | null>(null);
+  const [permission, setPermission] = useState<PermissionState | null>(null);
+  const [permissionLoading, setPermissionLoading] = useState(false);
+  // Live screen frame received on the receiver side
+  const liveFrameRef = useRef<HTMLImageElement | null>(null);
+  const [liveFrameActive, setLiveFrameActive] = useState(false);
 
   const selectedDevice = useMemo(() => {
     if (!snapshot) return undefined;
@@ -212,14 +222,64 @@ function App() {
     if (first) setSelectedDeviceId(first.device_id);
   }, [snapshot, selectedDeviceId]);
 
+  // Subscribe to live screen frames pushed by the backend
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let unlistenEnd: (() => void) | undefined;
+    listen<ScreenFrameEvent>("screen_frame", (event) => {
+      if (liveFrameRef.current) {
+        liveFrameRef.current.src = `data:image/jpeg;base64,${event.payload.jpeg_b64}`;
+      }
+      setLiveFrameActive(true);
+    }).then((fn) => { unlisten = fn; });
+    listen("screen_frame_ended", () => {
+      setLiveFrameActive(false);
+    }).then((fn) => { unlistenEnd = fn; });
+    return () => {
+      unlisten?.();
+      unlistenEnd?.();
+    };
+  }, []);
+
+  // Fetch initial permission state for sender mode
+  useEffect(() => {
+    if (snapshot?.mode === "sender" && !permission) {
+      invoke<PermissionState>("check_screen_permission")
+        .then(setPermission)
+        .catch(() => undefined);
+    }
+  }, [snapshot?.mode, permission]);
+
+  async function checkPermission() {
+    setPermissionLoading(true);
+    try {
+      const state = await invoke<PermissionState>("check_screen_permission");
+      setPermission(state);
+    } finally {
+      setPermissionLoading(false);
+    }
+  }
+
+  async function requestPermission() {
+    setPermissionLoading(true);
+    try {
+      const state = await invoke<PermissionState>("request_screen_permission");
+      setPermission(state);
+      if (state.screen_capture !== "granted") {
+        notify("info", "权限申请已发出", "请在系统设置中完成授权，然后重启应用。");
+      } else {
+        notify("success", "屏幕录制权限已授权");
+      }
+    } finally {
+      setPermissionLoading(false);
+    }
+  }
+
   useEffect(() => {
     if (snapshot?.mode !== "receiver") return;
     const timer = window.setInterval(() => {
       invoke<AppSnapshot>("get_snapshot")
         .then(setSnapshot)
-        .catch(() => undefined);
-      invoke<ScreenFrame | null>("get_latest_screen_frame")
-        .then(setLatestScreenFrame)
         .catch(() => undefined);
     }, 1200);
     return () => window.clearInterval(timer);
@@ -520,7 +580,8 @@ function App() {
             onRemoveTrusted={removeTrusted}
             onClearTrusted={clearTrusted}
             onOpenDiagnostic={openDiagnostic}
-            latestScreenFrame={latestScreenFrame}
+            liveFrameRef={liveFrameRef}
+            liveFrameActive={liveFrameActive}
           />
         ) : (
           <SenderView
@@ -544,6 +605,10 @@ function App() {
             onSendClipboardText={sendClipboardText}
             onStartScreen={startScreen}
             onStopScreen={stopScreen}
+            permission={permission}
+            permissionLoading={permissionLoading}
+            onCheckPermission={checkPermission}
+            onRequestPermission={requestPermission}
             onOpenDownloads={openDownloads}
             onOpenDiagnostic={openDiagnostic}
           />
@@ -686,6 +751,10 @@ function SenderView(props: {
   onStopScreen: () => void;
   onOpenDownloads: () => void;
   onOpenDiagnostic: () => void;
+  permission: PermissionState | null;
+  permissionLoading: boolean;
+  onCheckPermission: () => void;
+  onRequestPermission: () => void;
 }) {
   return (
     <div className="grid">
@@ -776,6 +845,12 @@ function SenderView(props: {
         <>
           <section className="panel share">
             <PanelTitle icon={<ScreenShare size={19} />} title="屏幕共享" />
+            <PermissionBanner
+              permission={props.permission}
+              loading={props.permissionLoading}
+              onCheck={props.onCheckPermission}
+              onRequest={props.onRequestPermission}
+            />
             <div className="screenPreview">
               {props.snapshot.screen_session ? (
                 <>
@@ -873,13 +948,9 @@ function ReceiverView(props: {
   onRemoveTrusted: (id: string) => void;
   onClearTrusted: () => void;
   onOpenDiagnostic: () => void;
-  latestScreenFrame: ScreenFrame | null;
+  liveFrameRef: React.RefObject<HTMLImageElement | null>;
+  liveFrameActive: boolean;
 }) {
-  const screenAge = props.latestScreenFrame
-    ? Date.now() - props.latestScreenFrame.updated_at_ms
-    : Infinity;
-  const screenStale = screenAge > 3500;
-
   return (
     <div className="grid receiverGrid">
       <section className="panel receiverHero">
@@ -915,26 +986,18 @@ function ReceiverView(props: {
 
       <section className="panel receiverScreen">
         <PanelTitle icon={<ScreenShare size={19} />} title="接收画面" />
-        {props.latestScreenFrame ? (
-          <>
-            <div className="receiverScreenMeta">
-              <strong>{props.latestScreenFrame.session.display_name}</strong>
-              <span>
-                {props.latestScreenFrame.width}x{props.latestScreenFrame.height}
-                {screenStale ? " · 已暂停" : " · 实时接收"}
-              </span>
-            </div>
-            <img
-              src={props.latestScreenFrame.data_url}
-              alt="远端屏幕画面"
-              className={`receiverScreenImage ${screenStale ? "stale" : ""}`}
-            />
-          </>
-        ) : (
-          <div className="screenPreview">
-            <span>等待控制端开始屏幕共享</span>
-          </div>
-        )}
+        <div className={`screenPreview receiverScreenWrap ${props.liveFrameActive ? "live" : ""}`}>
+          {props.liveFrameActive && <div className="liveBadge">LIVE</div>}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            ref={props.liveFrameRef}
+            alt="远端屏幕画面"
+            className={`receiverScreenImage${props.liveFrameActive ? " visible" : ""}`}
+          />
+          {!props.liveFrameActive && (
+            <span className="receiverScreenHint">等待控制端开始屏幕共享</span>
+          )}
+        </div>
       </section>
 
       <section className="panel trusted">
@@ -974,6 +1037,47 @@ function ReceiverView(props: {
         <PanelTitle icon={<ClipboardCopy size={19} />} title="剪贴板记录" />
         <ClipboardList records={props.snapshot.clipboard_texts} />
       </section>
+    </div>
+  );
+}
+
+function PermissionBanner(props: {
+  permission: PermissionState | null;
+  loading: boolean;
+  onCheck: () => void;
+  onRequest: () => void;
+}) {
+  const { permission } = props;
+  if (!permission) {
+    return (
+      <div className="permBanner permUnknown">
+        <span>屏幕录制权限状态未知</span>
+        <button onClick={props.onCheck} disabled={props.loading}>
+          {props.loading ? <Loading size="small" /> : <Check size={15} />}
+          检测权限
+        </button>
+      </div>
+    );
+  }
+  if (permission.screen_capture === "granted") {
+    return (
+      <div className="permBanner permOk">
+        <ShieldCheck size={15} />
+        <span>屏幕录制权限已授权</span>
+      </div>
+    );
+  }
+  return (
+    <div className="permBanner permDenied">
+      <ShieldX size={15} className="permIcon" />
+      <div className="permBody">
+        <strong>屏幕录制权限未授权</strong>
+        <p>{permission.hint}</p>
+      </div>
+      <button onClick={props.onRequest} disabled={props.loading}>
+        {props.loading ? <Loading size="small" /> : <ShieldCheck size={15} />}
+        请求权限
+      </button>
     </div>
   );
 }

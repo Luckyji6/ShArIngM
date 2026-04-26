@@ -856,3 +856,97 @@ button.primary .ant-spin-dot-item {
   flex-shrink: 0;
   margin-top: 2px;
 }
+
+/* ── Permission banner ──────────────────────────────────────────────────────── */
+
+.permBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  font-size: 13px;
+}
+
+.permOk {
+  background: #f3faf6;
+  border-color: #cdebda;
+  color: #176343;
+}
+
+.permOk svg {
+  flex-shrink: 0;
+  color: #1f9d68;
+}
+
+.permDenied {
+  background: #fdf3f1;
+  border-color: #f1c2b8;
+  color: #3f3f46;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.permDenied .permIcon {
+  color: #c53b25;
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+.permBody {
+  flex: 1;
+  min-width: 0;
+}
+
+.permBody strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #8c2a1f;
+}
+
+.permBody p {
+  margin: 0;
+  color: #52525b;
+  line-height: 1.5;
+}
+
+.permUnknown {
+  background: #fafafa;
+  border-color: #e4e4e7;
+  color: #71717a;
+  justify-content: space-between;
+}
+
+/* ── Receiver screen view ───────────────────────────────────────────────────── */
+
+.receiverScreenWrap {
+  position: relative;
+  min-height: 240px;
+  background: #18181b;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.receiverScreenWrap.live {
+  background: #0c0c0e;
+}
+
+.receiverScreenImage {
+  display: none;
+  width: 100%;
+  height: auto;
+  object-fit: contain;
+}
+
+.receiverScreenImage.visible {
+  display: block;
+}
+
+.receiverScreenHint {
+  color: #a1a1aa;
+  font-size: 14px;
+}
