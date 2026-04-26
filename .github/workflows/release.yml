@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            label: mac-apple-silicon
+            args: --target aarch64-apple-darwin
+          - platform: macos-15-intel
+            target: x86_64-apple-darwin
+            label: mac-intel
+            args: --target x86_64-apple-darwin
+          - platform: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+            args: ""
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - run: npm ci
+
+      - name: Build Tauri app
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: ${{ matrix.args }}
+
+      - name: Build Tauri app and publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: tauri-apps/tauri-action@v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "ShArIngM ${{ github.ref_name }}"
+          releaseBody: |
+            ## Download
+
+            | Platform | File |
+            |---|---|
+            | Windows (x64) | `ShArIngM-windows-x64-setup.exe` or `.msi` |
+            | macOS Apple Silicon (M1/M2/M3/M4) | `ShArIngM-mac-apple-silicon.dmg` |
+            | macOS Intel | `ShArIngM-mac-intel.dmg` |
+            | Linux (x64) | `ShArIngM-linux-x64.deb` / `.rpm` / `.AppImage` |
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Rename and re-upload release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          sleep 5
+          mkdir -p /tmp/rename
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+
+          rename_asset() {
+            local PATTERN="$1"
+            local NEW_NAME="$2"
+            local MATCH
+            MATCH=$(echo "$ASSETS" | grep -E "$PATTERN" | head -1 || true)
+            if [ -n "$MATCH" ]; then
+              echo "Renaming: $MATCH -> $NEW_NAME"
+              gh release download "$TAG" --pattern "$MATCH" --dir /tmp/rename/
+              cp "/tmp/rename/$MATCH" "/tmp/rename/$NEW_NAME"
+              gh release upload "$TAG" "/tmp/rename/$NEW_NAME" --clobber
+              gh release delete-asset "$TAG" "$MATCH" --yes 2>/dev/null || true
+            fi
+          }
+
+          case "$LABEL" in
+            windows-x64)
+              rename_asset '.*setup\.exe$' 'ShArIngM-windows-x64-setup.exe'
+              rename_asset '.*\.msi$' 'ShArIngM-windows-x64.msi'
+              ;;
+            mac-apple-silicon)
+              rename_asset '.*\.dmg$' 'ShArIngM-mac-apple-silicon.dmg'
+              ;;
+            mac-intel)
+              rename_asset '.*\.dmg$' 'ShArIngM-mac-intel.dmg'
+              ;;
+            linux-x64)
+              rename_asset '.*\.AppImage$' 'ShArIngM-linux-x64.AppImage'
+              rename_asset '.*\.deb$' 'ShArIngM-linux-x64.deb'
+              rename_asset '.*\.rpm$' 'ShArIngM-linux-x64.rpm'
+              ;;
+          esac
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShArIngM-${{ matrix.label }}
+          path: |
+            src-tauri/target/**/bundle/**/*.exe
+            src-tauri/target/**/bundle/**/*.msi
+            src-tauri/target/**/bundle/**/*.dmg
+            src-tauri/target/**/bundle/**/*.AppImage
+            src-tauri/target/**/bundle/**/*.deb
+            src-tauri/target/**/bundle/**/*.rpm
+          if-no-files-found: ignore
