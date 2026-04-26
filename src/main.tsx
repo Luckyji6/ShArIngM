@@ -44,6 +44,7 @@ type LanDevice = {
   protocol_version: string;
   capabilities: string[];
   last_seen_ms: number;
+  extra_addresses?: string[];
 };
 
 type TrustedDevice = {
@@ -172,6 +173,16 @@ function App() {
     if (first) setSelectedDeviceId(first.device_id);
   }, [snapshot, selectedDeviceId]);
 
+  useEffect(() => {
+    if (snapshot?.mode !== "receiver") return;
+    const timer = window.setInterval(() => {
+      invoke<AppSnapshot>("get_snapshot")
+        .then(setSnapshot)
+        .catch(() => undefined);
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [snapshot?.mode]);
+
   function notify(type: "success" | "error" | "info", title: string, body?: string) {
     notification[type]({
       message: title,
@@ -252,8 +263,8 @@ function App() {
     await run(
       () => invoke<PairingResult>("request_pairing", { deviceId: selectedDeviceId }),
       (result) => {
-        if (result.code_hint) setPairingCode(result.code_hint);
-        notify("info", "验证码已生成", result.message);
+        setPairingCode("");
+        notify("info", "已发送验证码请求", result.message);
       },
     );
   }
@@ -743,6 +754,13 @@ function ReceiverView(props: {
             <span>验证码验证通过后，才允许屏幕或文件通道。</span>
           </div>
         </div>
+        {props.snapshot.pending_pairing && (
+          <div className="receiverCodeBox">
+            <span>来自 {props.snapshot.pending_pairing.device_name} 的连接请求</span>
+            <strong>{props.snapshot.pending_pairing.code}</strong>
+            <small>请在控制端输入此 6 位验证码。</small>
+          </div>
+        )}
         <button className="primary" onClick={props.onStart} disabled={props.busy}>
           <Radar size={17} />
           {props.snapshot.discovery_active ? "刷新服务" : "启动服务"}

@@ -442,6 +442,28 @@ input:focus {
   line-height: 1.5;
 }
 
+.receiverCodeBox {
+  border: 1px solid #b8e2cc;
+  border-radius: 8px;
+  background: #f2fbf6;
+  padding: 14px;
+  display: grid;
+  gap: 6px;
+}
+
+.receiverCodeBox span,
+.receiverCodeBox small {
+  color: #176343;
+  font-size: 13px;
+}
+
+.receiverCodeBox strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 34px;
+  letter-spacing: 6px;
+  color: #0f5132;
+}
+
 .pulse {
   width: 16px;
   height: 16px;

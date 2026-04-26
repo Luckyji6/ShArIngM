@@ -12,13 +12,11 @@ use crate::{
     models::{
         AppMode, AppSnapshot, DisplaySourceKind, FileTransferRequest, LanDevice,
         NetworkDiagnosticReport, PairingResult, PendingPairing, ScreenSession, StartScreenRequest,
-        TransferRecord, TrustedDevice,
+        TransferRecord,
     },
     storage::StoredConfig,
 };
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
-use rand::Rng;
 use std::{collections::HashMap, path::PathBuf, process::Command, sync::Mutex};
 use tauri::{AppHandle, Manager, State};
 
@@ -59,6 +57,21 @@ impl AppCore {
         storage::save_to_path(&self.config_path, &self.config)
     }
 
+    fn sync_runtime_updates(&mut self) -> Result<()> {
+        let updates = self.discovery.drain_trusted_updates();
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        for trusted in updates {
+            self.config
+                .trusted_devices
+                .retain(|device| device.device_id != trusted.device_id);
+            self.config.trusted_devices.push(trusted);
+        }
+        self.save()
+    }
+
     fn snapshot(&self) -> AppSnapshot {
         let mut discovered = self.discovered.values().cloned().collect::<Vec<_>>();
         discovered.sort_by(|a, b| b.last_seen_ms.cmp(&a.last_seen_ms));
@@ -70,7 +83,10 @@ impl AppCore {
             discovery_active: self.discovery_active,
             trusted_devices: self.config.trusted_devices.clone(),
             discovered_devices: discovered,
-            pending_pairing: self.pending_pairing.clone(),
+            pending_pairing: self
+                .discovery
+                .pending_pairing()
+                .or_else(|| self.pending_pairing.clone()),
             transfers: self.transfers.clone(),
             screen_session: self.screen_session.clone(),
         }
@@ -82,7 +98,8 @@ impl AppCore {
 
         if mode == AppMode::Receiver {
             let identity = self.identity.clone();
-            self.discovery.start_receiver(&identity)?;
+            let config_path = self.config_path.clone();
+            self.discovery.start_receiver(&identity, config_path)?;
             self.discovery_active = true;
         } else {
             self.discovery.stop();
@@ -123,78 +140,52 @@ impl AppCore {
             .cloned()
             .with_context(|| format!("device {device_id} was not found"))?;
         let candidates = discovery::candidate_addresses_for(&device);
-        let reachable = discovery::check_control_plane_any(&candidates, device.port)
-            .context("被控端控制端口不可达，请确认另一台电脑已启动被控端服务，并允许防火墙访问")?;
+        let requester = self.identity.public_identity();
+        let (reachable, result) =
+            discovery::request_remote_pairing(&candidates, device.port, &requester).context(
+                "被控端控制端口不可达，请确认另一台电脑已启动被控端服务，并允许防火墙访问",
+            )?;
         if let Some(stored) = self.discovered.get_mut(&device.device_id) {
             stored.address = reachable.clone();
             if !stored.extra_addresses.iter().any(|item| item == &reachable) {
                 stored.extra_addresses.insert(0, reachable.clone());
             }
         }
-        let code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
-        self.pending_pairing = Some(PendingPairing {
-            device_id: device.device_id,
-            device_name: device.device_name,
-            code: code.clone(),
-            expires_at_ms: Utc::now().timestamp_millis() + 120_000,
-        });
-
-        Ok(PairingResult {
-            trusted: false,
-            challenge_required: true,
-            code_hint: Some(code),
-            message: "被控端已生成验证码，2 分钟内有效。".to_string(),
-        })
+        Ok(result)
     }
 
     fn verify_pairing(&mut self, device_id: &str, code: &str) -> Result<PairingResult> {
-        let now = Utc::now().timestamp_millis();
-        let pending = self
-            .pending_pairing
-            .clone()
-            .context("no pending pairing challenge")?;
-        if pending.device_id != device_id {
-            bail!("pending pairing target does not match");
-        }
-        if pending.expires_at_ms < now {
-            self.pending_pairing = None;
-            bail!("pairing code expired");
-        }
-        if pending.code != code.trim() {
-            bail!("pairing code is incorrect");
-        }
-
         let device = self
             .discovered
             .get(device_id)
             .cloned()
             .context("paired device is no longer available")?;
+        let candidates = discovery::candidate_addresses_for(&device);
+        let requester = self.identity.public_identity();
+        let (reachable, trusted_device, result) =
+            discovery::verify_remote_pairing(&candidates, device.port, &requester, code)?;
+        if let Some(stored) = self.discovered.get_mut(&device.device_id) {
+            stored.address = reachable.clone();
+            if !stored.extra_addresses.iter().any(|item| item == &reachable) {
+                stored.extra_addresses.insert(0, reachable);
+            }
+        }
+
         self.config
             .trusted_devices
             .retain(|item| item.device_id != device_id);
-        self.config.trusted_devices.push(TrustedDevice {
-            device_id: device.device_id,
-            device_name: device.device_name,
-            public_key: device.public_key,
-            fingerprint: device.fingerprint,
-            trusted_at_ms: now,
-            last_connected_ms: Some(now),
-        });
+        self.config.trusted_devices.push(trusted_device);
         self.pending_pairing = None;
         self.save()?;
 
-        Ok(PairingResult {
-            trusted: true,
-            challenge_required: false,
-            code_hint: None,
-            message: "配对成功，设备已加入可信列表。".to_string(),
-        })
+        Ok(result)
     }
 }
 
 #[tauri::command]
 fn get_snapshot(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
-    let core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+    let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+    core.sync_runtime_updates().map_err(to_command_error)?;
     Ok(core.snapshot())
 }
 
@@ -208,8 +199,9 @@ fn set_mode(mode: AppMode, state: State<'_, SharedApp>) -> Result<AppSnapshot, S
 fn start_receiver_services(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> {
     let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
     let identity = core.identity.clone();
+    let config_path = core.config_path.clone();
     core.discovery
-        .start_receiver(&identity)
+        .start_receiver(&identity, config_path)
         .map_err(to_command_error)?;
     core.discovery_active = true;
     Ok(core.snapshot())
@@ -328,7 +320,8 @@ pub fn run() {
             let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
             if core.config.mode == AppMode::Receiver {
                 let identity = core.identity.clone();
-                core.discovery.start_receiver(&identity)?;
+                let config_path = core.config_path.clone();
+                core.discovery.start_receiver(&identity, config_path)?;
                 core.discovery_active = true;
             }
             drop(core);

@@ -1,17 +1,22 @@
 use crate::{
     identity::Identity,
     models::{
-        AppMode, DiagnosticInterface, DiagnosticItem, DiagnosticStatus, LanDevice,
-        NetworkDiagnosticReport, PROTOCOL_VERSION, SERVICE_TYPE,
+        AppMode, DeviceIdentity, DiagnosticInterface, DiagnosticItem, DiagnosticStatus, LanDevice,
+        NetworkDiagnosticReport, PairingResult, PendingPairing, TrustedDevice, PROTOCOL_VERSION,
+        SERVICE_TYPE,
     },
+    storage,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     io::{ErrorKind, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -38,6 +43,42 @@ struct DiscoveryEntry {
     source: DiscoverySource,
 }
 
+#[derive(Clone)]
+struct IncomingPairing {
+    requester: DeviceIdentity,
+    pending: PendingPairing,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlRequest {
+    Ping,
+    PairRequest {
+        requester: DeviceIdentity,
+    },
+    VerifyPairing {
+        requester: DeviceIdentity,
+        code: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlResponse {
+    Pong,
+    PairChallenge {
+        expires_at_ms: i64,
+        message: String,
+    },
+    PairAccepted {
+        trusted_device: TrustedDevice,
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[derive(Default)]
 pub struct DiscoveryRuntime {
     mdns: Option<ServiceDaemon>,
@@ -46,17 +87,19 @@ pub struct DiscoveryRuntime {
     udp_thread: Option<JoinHandle<()>>,
     tcp_shutdown: Option<Arc<AtomicBool>>,
     tcp_thread: Option<JoinHandle<()>>,
+    pending_pairing: Arc<Mutex<Option<IncomingPairing>>>,
+    trusted_updates: Arc<Mutex<Vec<TrustedDevice>>>,
 }
 
 impl DiscoveryRuntime {
-    pub fn start_receiver(&mut self, identity: &Identity) -> Result<()> {
+    pub fn start_receiver(&mut self, identity: &Identity, config_path: PathBuf) -> Result<()> {
         if self.mdns.is_some() && self.udp_thread.is_some() && self.tcp_thread.is_some() {
             return Ok(());
         }
 
         let mut errors = Vec::new();
         if self.tcp_thread.is_none() {
-            if let Err(error) = self.start_tcp_control_listener() {
+            if let Err(error) = self.start_tcp_control_listener(identity, config_path) {
                 errors.push(format!("TCP control listener: {error:#}"));
             }
         }
@@ -79,6 +122,20 @@ impl DiscoveryRuntime {
                 errors.join("; ")
             ))
         }
+    }
+
+    pub fn pending_pairing(&self) -> Option<PendingPairing> {
+        self.pending_pairing
+            .lock()
+            .ok()
+            .and_then(|pending| pending.as_ref().map(|item| item.pending.clone()))
+    }
+
+    pub fn drain_trusted_updates(&self) -> Vec<TrustedDevice> {
+        self.trusted_updates
+            .lock()
+            .map(|mut updates| updates.drain(..).collect())
+            .unwrap_or_default()
     }
 
     fn start_mdns_advertiser(&mut self, identity: &Identity) -> Result<()> {
@@ -174,7 +231,11 @@ impl DiscoveryRuntime {
         Ok(())
     }
 
-    fn start_tcp_control_listener(&mut self) -> Result<()> {
+    fn start_tcp_control_listener(
+        &mut self,
+        identity: &Identity,
+        config_path: PathBuf,
+    ) -> Result<()> {
         if self.tcp_thread.is_some() {
             return Ok(());
         }
@@ -187,13 +248,22 @@ impl DiscoveryRuntime {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
+        let receiver = identity.public_identity();
+        let pending_pairing = self.pending_pairing.clone();
+        let trusted_updates = self.trusted_updates.clone();
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
                         let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
-                        handle_control_stream(&mut stream);
+                        handle_control_stream(
+                            &mut stream,
+                            &receiver,
+                            &config_path,
+                            &pending_pairing,
+                            &trusted_updates,
+                        );
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
@@ -209,9 +279,78 @@ impl DiscoveryRuntime {
     }
 }
 
-pub fn check_control_plane_any(addresses: &[String], port: u16) -> Result<String> {
+pub fn request_remote_pairing(
+    addresses: &[String],
+    port: u16,
+    requester: &DeviceIdentity,
+) -> Result<(String, PairingResult)> {
+    let response = send_control_request_any(
+        addresses,
+        port,
+        &ControlRequest::PairRequest {
+            requester: requester.clone(),
+        },
+    )?;
+
+    match response {
+        (address, ControlResponse::PairChallenge { message, .. }) => Ok((
+            address,
+            PairingResult {
+                trusted: false,
+                challenge_required: true,
+                code_hint: None,
+                message,
+            },
+        )),
+        (_, ControlResponse::Error { message }) => Err(anyhow!(message)),
+        (_, _) => Err(anyhow!("unexpected pairing response from receiver")),
+    }
+}
+
+pub fn verify_remote_pairing(
+    addresses: &[String],
+    port: u16,
+    requester: &DeviceIdentity,
+    code: &str,
+) -> Result<(String, TrustedDevice, PairingResult)> {
+    let response = send_control_request_any(
+        addresses,
+        port,
+        &ControlRequest::VerifyPairing {
+            requester: requester.clone(),
+            code: code.trim().to_string(),
+        },
+    )?;
+
+    match response {
+        (
+            address,
+            ControlResponse::PairAccepted {
+                trusted_device,
+                message,
+            },
+        ) => Ok((
+            address,
+            trusted_device,
+            PairingResult {
+                trusted: true,
+                challenge_required: false,
+                code_hint: None,
+                message,
+            },
+        )),
+        (_, ControlResponse::Error { message }) => Err(anyhow!(message)),
+        (_, _) => Err(anyhow!("unexpected verification response from receiver")),
+    }
+}
+
+fn send_control_request_any(
+    addresses: &[String],
+    port: u16,
+    request: &ControlRequest,
+) -> Result<(String, ControlResponse)> {
     if addresses.is_empty() {
-        return Err(anyhow!("no candidate address provided for control probe"));
+        return Err(anyhow!("no candidate address provided for control request"));
     }
 
     let mut errors = Vec::new();
@@ -219,8 +358,8 @@ pub fn check_control_plane_any(addresses: &[String], port: u16) -> Result<String
         if address.is_empty() {
             continue;
         }
-        match probe_single_address(address, port) {
-            Ok(()) => return Ok(address.clone()),
+        match send_control_request(address, port, request) {
+            Ok(response) => return Ok((address.clone(), response)),
             Err(error) => errors.push(format!("{address}: {error:#}")),
         }
     }
@@ -231,7 +370,11 @@ pub fn check_control_plane_any(addresses: &[String], port: u16) -> Result<String
     ))
 }
 
-fn probe_single_address(address: &str, port: u16) -> Result<()> {
+fn send_control_request(
+    address: &str,
+    port: u16,
+    request: &ControlRequest,
+) -> Result<ControlResponse> {
     let ip = address
         .parse::<IpAddr>()
         .with_context(|| format!("invalid device address {address}"))?;
@@ -244,28 +387,160 @@ fn probe_single_address(address: &str, port: u16) -> Result<()> {
     stream
         .set_write_timeout(Some(CONTROL_PROBE_TIMEOUT))
         .context("failed to configure control write timeout")?;
+    let payload = serde_json::to_vec(request).context("failed to encode control request")?;
     stream
-        .write_all(b"SHARINGM_CONTROL_PING_V1\n")
-        .context("failed to send control ping")?;
+        .write_all(&payload)
+        .context("failed to send control request")?;
+    let _ = stream.shutdown(Shutdown::Write);
 
-    let mut buf = [0_u8; 64];
-    let len = stream
-        .read(&mut buf)
-        .context("failed to read control ping response")?;
-    if &buf[..len] == b"SHARINGM_CONTROL_PONG_V1\n" {
-        Ok(())
-    } else {
-        Err(anyhow!("invalid control ping response"))
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .context("failed to read control response")?;
+    serde_json::from_slice(&response).context("failed to decode control response")
+}
+
+fn handle_control_stream(
+    stream: &mut TcpStream,
+    receiver: &DeviceIdentity,
+    config_path: &Path,
+    pending_pairing: &Arc<Mutex<Option<IncomingPairing>>>,
+    trusted_updates: &Arc<Mutex<Vec<TrustedDevice>>>,
+) {
+    let response = match read_control_request(stream) {
+        Ok(ControlRequest::Ping) => ControlResponse::Pong,
+        Ok(ControlRequest::PairRequest { requester }) => {
+            handle_pair_request(requester, pending_pairing)
+        }
+        Ok(ControlRequest::VerifyPairing { requester, code }) => handle_pair_verification(
+            receiver,
+            requester,
+            code,
+            config_path,
+            pending_pairing,
+            trusted_updates,
+        ),
+        Err(error) => ControlResponse::Error {
+            message: error.to_string(),
+        },
+    };
+
+    if let Ok(payload) = serde_json::to_vec(&response) {
+        let _ = stream.write_all(&payload);
     }
 }
 
-fn handle_control_stream(stream: &mut TcpStream) {
-    let mut buf = [0_u8; 64];
-    let Ok(len) = stream.read(&mut buf) else {
-        return;
+fn read_control_request(stream: &mut TcpStream) -> Result<ControlRequest> {
+    let mut payload = Vec::new();
+    stream
+        .read_to_end(&mut payload)
+        .context("failed to read control request")?;
+    serde_json::from_slice(&payload).context("failed to decode control request")
+}
+
+fn handle_pair_request(
+    requester: DeviceIdentity,
+    pending_pairing: &Arc<Mutex<Option<IncomingPairing>>>,
+) -> ControlResponse {
+    let code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+    let expires_at_ms = Utc::now().timestamp_millis() + 120_000;
+    let pending = PendingPairing {
+        device_id: requester.device_id.clone(),
+        device_name: requester.device_name.clone(),
+        code,
+        expires_at_ms,
     };
-    if &buf[..len] == b"SHARINGM_CONTROL_PING_V1\n" {
-        let _ = stream.write_all(b"SHARINGM_CONTROL_PONG_V1\n");
+
+    if let Ok(mut guard) = pending_pairing.lock() {
+        *guard = Some(IncomingPairing { requester, pending });
+    }
+
+    ControlResponse::PairChallenge {
+        expires_at_ms,
+        message: "验证码已在被控端显示，请在控制端输入。".to_string(),
+    }
+}
+
+fn handle_pair_verification(
+    receiver: &DeviceIdentity,
+    requester: DeviceIdentity,
+    code: String,
+    config_path: &Path,
+    pending_pairing: &Arc<Mutex<Option<IncomingPairing>>>,
+    trusted_updates: &Arc<Mutex<Vec<TrustedDevice>>>,
+) -> ControlResponse {
+    let now = Utc::now().timestamp_millis();
+    let trusted_requester = {
+        let mut guard = match pending_pairing.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return ControlResponse::Error {
+                    message: "被控端配对状态不可用。".to_string(),
+                }
+            }
+        };
+
+        let Some(pending) = guard.as_ref() else {
+            return ControlResponse::Error {
+                message: "被控端没有待验证的验证码，请重新请求。".to_string(),
+            };
+        };
+        if pending.requester.device_id != requester.device_id {
+            return ControlResponse::Error {
+                message: "验证码请求设备不匹配，请重新请求。".to_string(),
+            };
+        }
+        if pending.pending.expires_at_ms < now {
+            *guard = None;
+            return ControlResponse::Error {
+                message: "验证码已过期，请重新请求。".to_string(),
+            };
+        }
+        if pending.pending.code != code.trim() {
+            return ControlResponse::Error {
+                message: "验证码不正确。".to_string(),
+            };
+        }
+
+        *guard = None;
+        trusted_from_identity(&requester, now)
+    };
+
+    if let Err(error) = persist_trusted_device(config_path, trusted_requester.clone()) {
+        return ControlResponse::Error {
+            message: format!("被控端保存可信设备失败：{error:#}"),
+        };
+    }
+    if let Ok(mut updates) = trusted_updates.lock() {
+        updates.push(trusted_requester);
+    }
+
+    ControlResponse::PairAccepted {
+        trusted_device: trusted_from_identity(receiver, now),
+        message: "被控端验证通过，双方已记录可信设备。".to_string(),
+    }
+}
+
+fn persist_trusted_device(config_path: &Path, trusted: TrustedDevice) -> Result<()> {
+    let raw = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read config {}", config_path.display()))?;
+    let mut config: storage::StoredConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse config {}", config_path.display()))?;
+    config
+        .trusted_devices
+        .retain(|device| device.device_id != trusted.device_id);
+    config.trusted_devices.push(trusted);
+    storage::save_to_path(config_path, &config)
+}
+
+fn trusted_from_identity(identity: &DeviceIdentity, now: i64) -> TrustedDevice {
+    TrustedDevice {
+        device_id: identity.device_id.clone(),
+        device_name: identity.device_name.clone(),
+        public_key: identity.public_key.clone(),
+        fingerprint: identity.fingerprint.clone(),
+        trusted_at_ms: now,
+        last_connected_ms: Some(now),
     }
 }
 
@@ -282,8 +557,7 @@ pub fn browse_once() -> Result<Vec<LanDevice>> {
     let broadcast_targets = collect_broadcast_targets();
     send_udp_discovery(&udp, &broadcast_targets);
 
-    let devices: Arc<Mutex<HashMap<String, DiscoveryEntry>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let devices: Arc<Mutex<HashMap<String, DiscoveryEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let devices_for_thread = devices.clone();
 
     let handle = thread::spawn(move || {
@@ -419,7 +693,8 @@ fn upsert_device(
             }
             merge_address_pool(&mut device.extra_addresses, &existing.device.address);
 
-            let prefer_new = source == DiscoverySource::Udp || existing.source != DiscoverySource::Udp;
+            let prefer_new =
+                source == DiscoverySource::Udp || existing.source != DiscoverySource::Udp;
             if prefer_new {
                 existing.device = device;
                 existing.source = source;
@@ -434,10 +709,7 @@ fn upsert_device(
         None => {
             let address_clone = device.address.clone();
             merge_address_pool(&mut device.extra_addresses, &address_clone);
-            guard.insert(
-                device.device_id.clone(),
-                DiscoveryEntry { device, source },
-            );
+            guard.insert(device.device_id.clone(), DiscoveryEntry { device, source });
         }
     }
 }
@@ -604,14 +876,15 @@ pub fn run_network_diagnostic(mode: AppMode) -> NetworkDiagnosticReport {
         });
     }
 
-    let overall_status = items
-        .iter()
-        .map(|item| &item.status)
-        .fold(DiagnosticStatus::Ok, |acc, status| match (acc, status) {
-            (DiagnosticStatus::Fail, _) | (_, DiagnosticStatus::Fail) => DiagnosticStatus::Fail,
-            (DiagnosticStatus::Warn, _) | (_, DiagnosticStatus::Warn) => DiagnosticStatus::Warn,
-            _ => DiagnosticStatus::Ok,
-        });
+    let overall_status =
+        items
+            .iter()
+            .map(|item| &item.status)
+            .fold(DiagnosticStatus::Ok, |acc, status| match (acc, status) {
+                (DiagnosticStatus::Fail, _) | (_, DiagnosticStatus::Fail) => DiagnosticStatus::Fail,
+                (DiagnosticStatus::Warn, _) | (_, DiagnosticStatus::Warn) => DiagnosticStatus::Warn,
+                _ => DiagnosticStatus::Ok,
+            });
 
     NetworkDiagnosticReport {
         mode,
@@ -712,9 +985,7 @@ fn diagnose_mdns_daemon() -> DiagnosticItem {
             id: "mdns_daemon".to_string(),
             label: "mDNS 服务".to_string(),
             status: DiagnosticStatus::Warn,
-            detail: format!(
-                "mDNS 守护进程初始化失败：{error}。仍可依赖 UDP 广播继续发现设备。"
-            ),
+            detail: format!("mDNS 守护进程初始化失败：{error}。仍可依赖 UDP 广播继续发现设备。"),
         },
     }
 }
@@ -778,12 +1049,7 @@ fn diagnose_outbound_udp_broadcast() -> DiagnosticItem {
     }
 }
 
-fn diagnose_port_listenable(
-    id: &str,
-    label: &str,
-    port: u16,
-    is_udp: bool,
-) -> DiagnosticItem {
+fn diagnose_port_listenable(id: &str, label: &str, port: u16, is_udp: bool) -> DiagnosticItem {
     let bind_result: Result<()> = if is_udp {
         UdpSocket::bind(("0.0.0.0", port))
             .map(|_| ())
@@ -799,9 +1065,7 @@ fn diagnose_port_listenable(
             id: id.to_string(),
             label: label.to_string(),
             status: DiagnosticStatus::Warn,
-            detail: format!(
-                "端口 {port} 当前未被监听。请通过设置启动被控端服务后再次自查。"
-            ),
+            detail: format!("端口 {port} 当前未被监听。请通过设置启动被控端服务后再次自查。"),
         },
         Err(error) => {
             let kind = error
@@ -839,10 +1103,7 @@ fn firewall_hint() -> Option<String> {
                 .to_string(),
         )
     } else if cfg!(target_os = "linux") {
-        Some(
-            "Linux：如启用了 ufw / firewalld，请放行 UDP 41875 与 TCP 41874 端口。"
-                .to_string(),
-        )
+        Some("Linux：如启用了 ufw / firewalld，请放行 UDP 41875 与 TCP 41874 端口。".to_string())
     } else {
         None
     }
