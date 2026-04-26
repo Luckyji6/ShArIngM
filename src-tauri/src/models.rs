@@ -35,6 +35,8 @@ pub struct LanDevice {
     pub protocol_version: String,
     pub capabilities: Vec<String>,
     pub last_seen_ms: i64,
+    #[serde(default)]
+    pub extra_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,4 +122,39 @@ pub struct StartScreenRequest {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticItem {
+    pub id: String,
+    pub label: String,
+    pub status: DiagnosticStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticInterface {
+    pub name: String,
+    pub address: String,
+    pub broadcast: Option<String>,
+    pub is_loopback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkDiagnosticReport {
+    pub mode: AppMode,
+    pub generated_at_ms: i64,
+    pub overall_status: DiagnosticStatus,
+    pub items: Vec<DiagnosticItem>,
+    pub interfaces: Vec<DiagnosticInterface>,
+    pub broadcast_targets: Vec<String>,
+    pub firewall_hint: Option<String>,
 }

@@ -1,12 +1,15 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
-import { notification, Spin } from "antd";
+import { Modal, notification, Spin } from "antd";
 import {
+  AlertTriangle,
   Cast,
   Check,
+  CircleX,
   Download,
   FolderOpen,
+  Info,
   MonitorUp,
   PlugZap,
   Radar,
@@ -15,6 +18,7 @@ import {
   ScreenShare,
   Send,
   ShieldCheck,
+  Stethoscope,
   Trash2,
   Wifi,
 } from "lucide-react";
@@ -98,6 +102,32 @@ type PairingResult = {
   message: string;
 };
 
+type DiagnosticStatus = "ok" | "warn" | "fail";
+
+type DiagnosticItem = {
+  id: string;
+  label: string;
+  status: DiagnosticStatus;
+  detail: string;
+};
+
+type DiagnosticInterface = {
+  name: string;
+  address: string;
+  broadcast?: string;
+  is_loopback: boolean;
+};
+
+type NetworkDiagnosticReport = {
+  mode: AppMode;
+  generated_at_ms: number;
+  overall_status: DiagnosticStatus;
+  items: DiagnosticItem[];
+  interfaces: DiagnosticInterface[];
+  broadcast_targets: string[];
+  firewall_hint?: string;
+};
+
 const DEFAULT_DISPLAY = {
   display_name: "Primary Display",
   width: 1920,
@@ -114,6 +144,9 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [diagnosticOpen, setDiagnosticOpen] = useState(false);
+  const [diagnostic, setDiagnostic] = useState<NetworkDiagnosticReport | null>(null);
+  const [diagnosticRunning, setDiagnosticRunning] = useState(false);
 
   const selectedDevice = useMemo(() => {
     if (!snapshot) return undefined;
@@ -304,6 +337,24 @@ function App() {
     );
   }
 
+  async function openDiagnostic() {
+    setDiagnosticOpen(true);
+    await runDiagnostic();
+  }
+
+  async function runDiagnostic() {
+    if (diagnosticRunning) return;
+    setDiagnosticRunning(true);
+    try {
+      const report = await invoke<NetworkDiagnosticReport>("run_network_diagnostic");
+      setDiagnostic(report);
+    } catch (err) {
+      notify("error", "网络自查失败", err instanceof Error ? err.message : String(err));
+    } finally {
+      setDiagnosticRunning(false);
+    }
+  }
+
   if (!snapshot) {
     return (
       <main className="shell loading">
@@ -365,6 +416,7 @@ function App() {
             busy={busy}
             onClose={() => setSettingsOpen(false)}
             onSetMode={setMode}
+            onOpenDiagnostic={openDiagnostic}
           />
         ) : snapshot.mode === "receiver" ? (
           <ReceiverView
@@ -373,6 +425,7 @@ function App() {
             onStart={refreshReceiverService}
             onOpenDownloads={openDownloads}
             onRemoveTrusted={removeTrusted}
+            onOpenDiagnostic={openDiagnostic}
           />
         ) : (
           <SenderView
@@ -394,9 +447,18 @@ function App() {
             onStartScreen={startScreen}
             onStopScreen={stopScreen}
             onOpenDownloads={openDownloads}
+            onOpenDiagnostic={openDiagnostic}
           />
         )}
       </section>
+
+      <DiagnosticModal
+        open={diagnosticOpen}
+        running={diagnosticRunning}
+        report={diagnostic}
+        onClose={() => setDiagnosticOpen(false)}
+        onRefresh={runDiagnostic}
+      />
     </main>
   );
 }
@@ -406,6 +468,7 @@ function SettingsView(props: {
   busy: boolean;
   onClose: () => void;
   onSetMode: (mode: AppMode) => Promise<boolean>;
+  onOpenDiagnostic: () => void;
 }) {
   const [pendingMode, setPendingMode] = useState<AppMode>(props.snapshot.mode);
   const changed = pendingMode !== props.snapshot.mode;
@@ -468,6 +531,18 @@ function SettingsView(props: {
             被控端模式下，关闭主窗口会隐藏到后台并保持局域网服务；需要彻底退出时使用系统托盘菜单的退出。
           </p>
         </div>
+        <div className="settingBlock">
+          <div>
+            <strong>本地网络自查</strong>
+            <p>
+              检测网卡、广播地址、mDNS 守护进程、UDP/TCP 监听情况，帮助快速定位发现不到设备或无法连接的原因。
+            </p>
+          </div>
+          <button onClick={props.onOpenDiagnostic} disabled={props.busy}>
+            <Stethoscope size={17} />
+            运行网络自查
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -492,19 +567,26 @@ function SenderView(props: {
   onStartScreen: () => void;
   onStopScreen: () => void;
   onOpenDownloads: () => void;
+  onOpenDiagnostic: () => void;
 }) {
   return (
     <div className="grid">
       <section className="panel devices">
         <PanelTitle icon={<Radar size={19} />} title="局域网设备" />
-        <button
-          className="primary"
-          onClick={props.onDiscover}
-          disabled={props.scanning}
-        >
-          {props.scanning ? <Loading size="small" /> : <RefreshCcw size={17} />}
-          {props.scanning ? "扫描中" : "扫描设备"}
-        </button>
+        <div className="rowActions">
+          <button
+            className="primary"
+            onClick={props.onDiscover}
+            disabled={props.scanning}
+          >
+            {props.scanning ? <Loading size="small" /> : <RefreshCcw size={17} />}
+            {props.scanning ? "扫描中" : "扫描设备"}
+          </button>
+          <button onClick={props.onOpenDiagnostic} disabled={props.scanning}>
+            <Stethoscope size={17} />
+            网络自查
+          </button>
+        </div>
         <div className="deviceList loadingHost">
           {props.scanning && <LoadingOverlay label="正在搜索局域网设备" />}
           {props.snapshot.discovered_devices.length === 0 && (
@@ -647,6 +729,7 @@ function ReceiverView(props: {
   onStart: () => void;
   onOpenDownloads: () => void;
   onRemoveTrusted: (id: string) => void;
+  onOpenDiagnostic: () => void;
 }) {
   return (
     <div className="grid receiverGrid">
@@ -667,6 +750,10 @@ function ReceiverView(props: {
         <button onClick={props.onOpenDownloads}>
           <FolderOpen size={17} />
           打开下载目录
+        </button>
+        <button onClick={props.onOpenDiagnostic}>
+          <Stethoscope size={17} />
+          网络自查
         </button>
       </section>
 
@@ -694,6 +781,127 @@ function ReceiverView(props: {
       </section>
     </div>
   );
+}
+
+function DiagnosticModal(props: {
+  open: boolean;
+  running: boolean;
+  report: NetworkDiagnosticReport | null;
+  onClose: () => void;
+  onRefresh: () => void;
+}) {
+  const overall = props.report?.overall_status;
+  const overallLabel =
+    overall === "ok"
+      ? "整体正常"
+      : overall === "warn"
+      ? "存在告警"
+      : overall === "fail"
+      ? "存在阻断项"
+      : "等待结果";
+  return (
+    <Modal
+      open={props.open}
+      onCancel={props.onClose}
+      width={680}
+      title={
+        <div className="diagnosticTitle">
+          <Stethoscope size={19} />
+          <span>本地网络自查</span>
+          {props.report && (
+            <DiagnosticBadge status={props.report.overall_status} label={overallLabel} />
+          )}
+        </div>
+      }
+      footer={
+        <div className="diagnosticFooter">
+          <button onClick={props.onRefresh} disabled={props.running}>
+            {props.running ? <Loading size="small" /> : <RefreshCcw size={17} />}
+            重新检测
+          </button>
+          <button className="primary" onClick={props.onClose}>
+            完成
+          </button>
+        </div>
+      }
+    >
+      {props.running && !props.report ? (
+        <div className="diagnosticLoading">
+          <Loading />
+          <span>正在收集网络信息...</span>
+        </div>
+      ) : props.report ? (
+        <div className="diagnosticBody">
+          <div className="diagnosticItems">
+            {props.report.items.map((item) => (
+              <div key={item.id} className={`diagnosticItem status-${item.status}`}>
+                <DiagnosticIcon status={item.status} />
+                <div>
+                  <strong>{item.label}</strong>
+                  <p>{item.detail}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="diagnosticInterfaces">
+            <h4>本机接口</h4>
+            {props.report.interfaces.length === 0 ? (
+              <p className="muted">未发现任何接口。</p>
+            ) : (
+              <div className="diagnosticInterfaceList">
+                {props.report.interfaces.map((iface, index) => (
+                  <div key={`${iface.name}-${iface.address}-${index}`} className="diagnosticIfaceRow">
+                    <strong>{iface.name}</strong>
+                    <span>{iface.address}</span>
+                    <small>
+                      {iface.is_loopback
+                        ? "loopback"
+                        : iface.broadcast
+                        ? `bcast ${iface.broadcast}`
+                        : "无广播"}
+                    </small>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="diagnosticTargets">
+            <h4>广播投递目标</h4>
+            {props.report.broadcast_targets.length === 0 ? (
+              <p className="muted">未生成任何广播目标。</p>
+            ) : (
+              <ul>
+                {props.report.broadcast_targets.map((target) => (
+                  <li key={target}>{target}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          {props.report.firewall_hint && (
+            <div className="diagnosticHint">
+              <Info size={16} />
+              <span>{props.report.firewall_hint}</span>
+            </div>
+          )}
+        </div>
+      ) : (
+        <Empty text="暂无自查结果，请点击重新检测。" />
+      )}
+    </Modal>
+  );
+}
+
+function DiagnosticIcon({ status }: { status: DiagnosticStatus }) {
+  if (status === "ok") return <Check size={18} className="okIcon" />;
+  if (status === "warn") return <AlertTriangle size={18} className="warnIcon" />;
+  return <CircleX size={18} className="failIcon" />;
+}
+
+function DiagnosticBadge({ status, label }: { status: DiagnosticStatus; label: string }) {
+  return <span className={`diagnosticBadge status-${status}`}>{label}</span>;
 }
 
 function TransferList({ transfers }: { transfers: TransferRecord[] }) {

@@ -10,20 +10,16 @@ use crate::{
     display::{CaptureSource, DisplaySource, VirtualDisplaySource},
     identity::Identity,
     models::{
-        AppMode, AppSnapshot, DisplaySourceKind, FileTransferRequest, LanDevice, PairingResult,
-        PendingPairing, ScreenSession, StartScreenRequest, TransferRecord, TrustedDevice,
+        AppMode, AppSnapshot, DisplaySourceKind, FileTransferRequest, LanDevice,
+        NetworkDiagnosticReport, PairingResult, PendingPairing, ScreenSession, StartScreenRequest,
+        TransferRecord, TrustedDevice,
     },
     storage::StoredConfig,
 };
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rand::Rng;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    process::Command,
-    sync::Mutex,
-};
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::Mutex};
 use tauri::{AppHandle, Manager, State};
 
 struct SharedApp {
@@ -126,6 +122,15 @@ impl AppCore {
             .get(device_id)
             .cloned()
             .with_context(|| format!("device {device_id} was not found"))?;
+        let candidates = discovery::candidate_addresses_for(&device);
+        let reachable = discovery::check_control_plane_any(&candidates, device.port)
+            .context("被控端控制端口不可达，请确认另一台电脑已启动被控端服务，并允许防火墙访问")?;
+        if let Some(stored) = self.discovered.get_mut(&device.device_id) {
+            stored.address = reachable.clone();
+            if !stored.extra_addresses.iter().any(|item| item == &reachable) {
+                stored.extra_addresses.insert(0, reachable.clone());
+            }
+        }
         let code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
         self.pending_pairing = Some(PendingPairing {
             device_id: device.device_id,
@@ -164,7 +169,9 @@ impl AppCore {
             .get(device_id)
             .cloned()
             .context("paired device is no longer available")?;
-        self.config.trusted_devices.retain(|item| item.device_id != device_id);
+        self.config
+            .trusted_devices
+            .retain(|item| item.device_id != device_id);
         self.config.trusted_devices.push(TrustedDevice {
             device_id: device.device_id,
             device_name: device.device_name,
@@ -217,7 +224,10 @@ fn discover_devices(state: State<'_, SharedApp>) -> Result<AppSnapshot, String> 
 }
 
 #[tauri::command]
-fn request_pairing(device_id: String, state: State<'_, SharedApp>) -> Result<PairingResult, String> {
+fn request_pairing(
+    device_id: String,
+    state: State<'_, SharedApp>,
+) -> Result<PairingResult, String> {
     let mut core = state.inner.lock().map_err(|_| "state lock poisoned")?;
     core.request_pairing(&device_id).map_err(to_command_error)
 }
@@ -296,6 +306,15 @@ fn available_display_sources() -> Vec<DisplaySourceKind> {
     vec![capture.kind(), virtual_display.kind()]
 }
 
+#[tauri::command]
+fn run_network_diagnostic(state: State<'_, SharedApp>) -> Result<NetworkDiagnosticReport, String> {
+    let mode = {
+        let core = state.inner.lock().map_err(|_| "state lock poisoned")?;
+        core.config.mode.clone()
+    };
+    Ok(discovery::run_network_diagnostic(mode))
+}
+
 pub fn run() {
     let core = AppCore::load().expect("failed to load ShArIngM state");
 
@@ -345,7 +364,8 @@ pub fn run() {
             start_screen_share,
             stop_screen_share,
             open_downloads_folder,
-            available_display_sources
+            available_display_sources,
+            run_network_diagnostic
         ])
         .build(tauri::generate_context!())
         .expect("error while building ShArIngM")
